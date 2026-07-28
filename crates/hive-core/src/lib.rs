@@ -8,10 +8,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod credential;
+pub mod docker;
 pub mod harness;
 pub mod mcp;
 pub mod network;
+pub mod reconcile;
 
 pub use harness::{HarnessDef, ModelSyntax, Unsupported};
 
