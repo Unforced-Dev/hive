@@ -9,7 +9,9 @@
 #                                  Docker daemon (creates and destroys containers)
 #   ./build.sh <cmd...>            run an arbitrary cargo command
 set -euo pipefail
-HOST="${HIVE_BUILD_HOST:-root@uni}"
+# No default host: this repo builds on a remote Linux box with Docker, and
+# guessing someone else's hostname is worse than asking.
+HOST="${HIVE_BUILD_HOST:?set HIVE_BUILD_HOST, e.g. root@your-box}"
 REMOTE="${HIVE_BUILD_DIR:-/root/hive}"
 
 DOCKER_ARGS=()

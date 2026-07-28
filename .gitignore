@@ -4,3 +4,6 @@ Cargo.lock.bak
 
 # Cargo.lock IS committed: this workspace ships binaries, and the image build
 # claims reproducibility. An uncommitted lock makes that claim false.
+
+# local env
+.envrc

@@ -81,7 +81,7 @@ fn info() -> Value {
                     "type": "string",
                     "title": "hive host",
                     "description": "user@host running hived. Uses your existing SSH key; no daemon is exposed to the network.",
-                    "default": "root@uni"
+                    "default": "root@hive-host"
                 },
                 "spec_dir": {
                     "type": "string",
@@ -139,7 +139,7 @@ fn deploy(req: &Value) -> Result<Value> {
     let get = |k: &str| cfg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let ssh_host = {
         let h = get("ssh_host");
-        if h.is_empty() { "root@uni".to_string() } else { h }
+        if h.is_empty() { "root@hive-host".to_string() } else { h }
     };
     let spec_dir = {
         let d = get("spec_dir");

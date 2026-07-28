@@ -1,0 +1,5 @@
+# Copy to .envrc (gitignored) or export these before running build.sh.
+# There are no defaults on purpose: hive builds on a remote Linux box with
+# Docker, and guessing someone else's hostname is worse than asking.
+export HIVE_BUILD_HOST=root@your-box
+export BUZZ_TREE=/path/to/a/buzz/checkout/on/that/box

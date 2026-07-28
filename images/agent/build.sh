@@ -10,9 +10,9 @@
 # the stable coordinate.
 set -euo pipefail
 
-HOST="${HIVE_BUILD_HOST:-root@uni}"
+HOST="${HIVE_BUILD_HOST:?set HIVE_BUILD_HOST, e.g. root@your-box}"
 REMOTE="${HIVE_BUILD_DIR:-/root/hive}"
-BUZZ_TREE="${BUZZ_TREE:-/root/box/build/buzz}"
+BUZZ_TREE="${BUZZ_TREE:?set BUZZ_TREE to a buzz checkout on $HOST}"
 IMAGE="${HIVE_IMAGE:-hive-agent}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

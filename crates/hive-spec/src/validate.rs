@@ -352,7 +352,7 @@ mod tests {
     use crate::*;
     use std::collections::BTreeMap;
 
-    const PK: &str = "3e748f43fe80e8e2e07f23893acef8eb028db9704f66c4478ce224f8d20ce151";
+    const PK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn base() -> AgentSpec {
         AgentSpec {
@@ -574,9 +574,9 @@ mod tests {
         let parsed: AgentSpec = AgentSpec::from_toml(
             r#"
             [identity]
-            pubkey = "3e748f43fe80e8e2e07f23893acef8eb028db9704f66c4478ce224f8d20ce151"
+            pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             relay_url = "wss://buzz.example.org"
-            owner_pubkey = "3e748f43fe80e8e2e07f23893acef8eb028db9704f66c4478ce224f8d20ce151"
+            owner_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             [harness]
             id = "claude"
             "#,
