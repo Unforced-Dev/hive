@@ -13,6 +13,12 @@
 //!
 //! Every test cleans up after itself and uses a distinct name prefix, so a
 //! failed run leaves at most its own debris.
+//!
+//! They must run SERIALLY (`--test-threads=1`, which `build.sh --docker` sets).
+//! They share one Docker daemon, and `list()` observes global state — every
+//! hive-managed container on the box, including ones another test is mid-way
+//! through creating. In parallel this fails intermittently for reasons unrelated
+//! to the code under test.
 
 use hive_core::backend::*;
 use hive_core::docker::{labels_for, DockerBackend};

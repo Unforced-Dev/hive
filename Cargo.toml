@@ -4,6 +4,7 @@ members = [
     "crates/hive-spec",
     "crates/hive-core",
     "crates/hive-broker",
+    "crates/hive-headers",
     "crates/hived",
     "crates/hive-cli",
     "crates/buzz-backend-hive",

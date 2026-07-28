@@ -24,15 +24,30 @@ if [ "${1:-}" = "--docker" ]; then
     DOCKER_ARGS=(
         -v /var/run/docker.sock:/var/run/docker.sock
         -v /usr/bin/docker:/usr/bin/docker:ro
+        # Same path inside and out. `docker run -v` resolves paths against the
+        # HOST, not against this build container, so a socket created at
+        # /run/hive here must be at /run/hive there too or the bind-mount
+        # silently produces an empty directory in the agent container.
+        -v /run/hive:/run/hive
         -e HIVE_DOCKER_TESTS=1
     )
-    CARGO_CMD=(cargo test --workspace)
+    # --test-threads=1: these tests share ONE Docker daemon, and list() observes
+    # global state — every hive-managed container on the box, including ones
+    # other tests are mid-way through creating or destroying. Run in parallel it
+    # fails intermittently and for reasons that have nothing to do with the code
+    # under test, which is worse than being slow.
+    CARGO_CMD=(cargo test --workspace -- --test-threads=1)
 fi
 
 if [ $# -gt 0 ]; then
     CARGO_CMD=("$@")
 elif [ ${#CARGO_CMD[@]} -eq 0 ]; then
-    CARGO_CMD=(cargo test --workspace)
+    # --test-threads=1: these tests share ONE Docker daemon, and list() observes
+    # global state — every hive-managed container on the box, including ones
+    # other tests are mid-way through creating or destroying. Run in parallel it
+    # fails intermittently and for reasons that have nothing to do with the code
+    # under test, which is worse than being slow.
+    CARGO_CMD=(cargo test --workspace -- --test-threads=1)
 fi
 
 ssh "$HOST" "mkdir -p $REMOTE"
@@ -41,5 +56,5 @@ ssh "$HOST" "cd $REMOTE && docker run --rm \
   -v $REMOTE:/w -w /w \
   -v hive-cargo:/usr/local/cargo/registry \
   -v hive-target:/w/target \
-  ${DOCKER_ARGS[*]} \
+  ${DOCKER_ARGS[*]:-} \
   rust:1.95-bookworm ${CARGO_CMD[*]}"

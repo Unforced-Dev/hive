@@ -33,6 +33,22 @@ RUN cargo build --release --locked -p buzz-acp --bin buzz-acp -p buzz-cli --bin 
     && strip target/release/buzz-acp target/release/buzz
 
 # ---------------------------------------------------------------------------
+# Stage 1b: hive-headers, the in-container MCP credentials helper
+# ---------------------------------------------------------------------------
+# Built from THIS repo (the main build context). Claude Code runs it once per
+# MCP connection, on a 10-second budget, and reads auth headers from its stdout;
+# it asks the broker over a per-agent socket so no secret is ever written into
+# the container. Rust rather than a shell script because the image has no `nc`
+# or `socat`, and rather than node because a helper on a 10s budget should not
+# depend on a runtime a future base image might not carry.
+FROM rust:1.95-bookworm AS hive-builder
+WORKDIR /hive
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+RUN cargo build --release --locked -p hive-headers \
+    && strip target/release/hive-headers
+
+# ---------------------------------------------------------------------------
 # Stage 2: runtime
 # ---------------------------------------------------------------------------
 FROM node:24-bookworm-slim
@@ -186,6 +202,7 @@ RUN set -eux; \
 
 COPY --from=builder /build/target/release/buzz-acp /usr/local/bin/buzz-acp
 COPY --from=builder /build/target/release/buzz /usr/local/bin/buzz
+COPY --from=hive-builder /hive/target/release/hive-headers /usr/local/bin/hive-headers
 
 # ---------------------------------------------------------------------------
 # THE ASSERTION
@@ -201,7 +218,7 @@ COPY --from=builder /build/target/release/buzz /usr/local/bin/buzz
 # of bug that is otherwise invisible until deploy time.
 RUN set -eux; \
     missing=""; \
-    for b in buzz-acp buzz \
+    for b in buzz-acp buzz hive-headers \
              claude-agent-acp claude codex-acp codex goose \
              grok opencode kimi amp-acp amp omp cursor-agent; do \
       command -v "$b" >/dev/null 2>&1 || missing="$missing $b"; \

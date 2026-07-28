@@ -1,5 +1,6 @@
 [package]
-name = "hive-broker"
+name = "hive-headers"
+description = "MCP headers helper: runs inside an agent container and asks the hive broker for credentials."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +9,4 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-hive-core.workspace = true
-hive-spec.workspace = true
 serde_json.workspace = true
-serde.workspace = true
-thiserror.workspace = true
-tracing.workspace = true

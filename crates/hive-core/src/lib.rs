@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod backend;
 pub mod credential;
 pub mod docker;
@@ -36,9 +37,10 @@ mod image_contract {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
-    /// Binaries the image needs that are not harnesses: the ACP bridge, and the
-    /// CLI the agent shells out to in order to post its replies.
-    const INFRA_BINARIES: &[&str] = &["buzz-acp", "buzz"];
+    /// Binaries the image needs that are not harnesses: the ACP bridge, the CLI
+    /// the agent shells out to in order to post its replies, and the MCP
+    /// credentials helper Claude Code executes per connection.
+    const INFRA_BINARIES: &[&str] = &["buzz-acp", "buzz", "hive-headers"];
 
     fn dockerfile_assertion_list() -> Vec<String> {
         let src = image_file("Dockerfile");
