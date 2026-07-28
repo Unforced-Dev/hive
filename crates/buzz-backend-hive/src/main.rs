@@ -166,6 +166,10 @@ fn deploy(req: &Value) -> Result<Value> {
     // the process, and in Rust 2024 that is an unsafe operation.
     let primary = std::env::var("HIVE_PRIMARY_RELAY").ok();
     let name = agent_name(display_name, relay_url, primary.as_deref());
+    // The IDENTITY key is keyed on the base slug, without the relay suffix, so
+    // deploying the same agent to a second relay reuses one stored private key
+    // instead of writing a second copy that goes stale on rotation.
+    let identity_key = format!("nsec/{}", slugify(display_name));
 
     let mut warnings: Vec<String> = Vec::new();
     if owner.is_empty() && agent.get("auth_tag").is_none() {
@@ -177,12 +181,12 @@ fn deploy(req: &Value) -> Result<Value> {
         );
     }
 
-    let spec = build_spec(&agent, &cfg, pubkey, relay_url, owner);
+    let spec = build_spec(&agent, &cfg, pubkey, relay_url, owner, &identity_key);
 
     // The nsec goes to the broker over SSH stdin, never as an argument:
     // arguments land in shell history and in `ps` output for every user on the
     // box. It is not written into the spec, which is meant to be committable.
-    ssh_stdin(&ssh_host, &["hive", "secret", "put", &format!("nsec/{name}")], nsec)
+    ssh_stdin(&ssh_host, &["hive", "secret", "put", &identity_key], nsec)
         .context("storing the agent key in the hive broker")?;
 
     // `cat > file` rather than scp: one connection, no temp file on either side,
@@ -205,14 +209,7 @@ fn deploy(req: &Value) -> Result<Value> {
 /// replaces its first container rather than running alongside it.
 fn agent_name(display_name: &str, relay_url: &str, primary_relay: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
-    let slug: String = display_name
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .replace("--", "-");
-    let slug = if slug.is_empty() { "agent".to_string() } else { slug };
+    let slug = slugify(display_name);
 
     match primary_relay {
         Some(primary) if primary != relay_url => {
@@ -223,7 +220,27 @@ fn agent_name(display_name: &str, relay_url: &str, primary_relay: Option<&str>) 
     }
 }
 
-fn build_spec(agent: &Value, cfg: &Value, pubkey: &str, relay_url: &str, owner: &str) -> String {
+/// Agent name without the relay suffix. Also the identity key's basis, so the
+/// two cannot drift apart.
+fn slugify(display_name: &str) -> String {
+    let slug: String = display_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .replace("--", "-");
+    if slug.is_empty() { "agent".to_string() } else { slug }
+}
+
+fn build_spec(
+    agent: &Value,
+    cfg: &Value,
+    pubkey: &str,
+    relay_url: &str,
+    owner: &str,
+    identity_key: &str,
+) -> String {
     let s = |k: &str| cfg.get(k).and_then(Value::as_str).unwrap_or("");
     let harness = if s("harness").is_empty() { "claude" } else { s("harness") };
     let memory = if s("memory").is_empty() { "3g" } else { s("memory") };
@@ -236,6 +253,10 @@ fn build_spec(agent: &Value, cfg: &Value, pubkey: &str, relay_url: &str, owner: 
     out.push_str("[identity]\n");
     out.push_str(&format!("pubkey = {}\n", toml_str(pubkey)));
     out.push_str(&format!("relay_url = {}\n", toml_str(relay_url)));
+    // Named explicitly rather than left to default to nsec/<file-name>: the file
+    // name carries a relay suffix for non-primary relays, and the identity does
+    // not vary by relay.
+    out.push_str(&format!("credential = {}\n", toml_str(identity_key)));
     if let Some(tag) = agent.get("auth_tag").and_then(Value::as_str) {
         out.push_str(&format!("auth_tag = {}\n", toml_str(tag)));
     } else if !owner.is_empty() {
@@ -380,7 +401,7 @@ mod tests {
             "relay_url": "wss://relay.example",
             "owner_pubkey": "b".repeat(64),
         });
-        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64));
+        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni");
         assert!(!spec.contains("nsec1verysecret"), "the spec leaked the private key");
         assert!(spec.contains("owner_pubkey"));
     }
@@ -396,7 +417,7 @@ mod tests {
             "owner_pubkey": "b".repeat(64),
         });
         let cfg = json!({ "harness": "claude", "mcp_url": "https://v.example/mcp", "mcp_auth_ref": "mcp/parachute" });
-        let spec = build_spec(&agent, &cfg, &"a".repeat(64), "wss://relay.example", &"b".repeat(64));
+        let spec = build_spec(&agent, &cfg, &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni");
         let parsed = hive_spec::AgentSpec::from_toml(&spec)
             .unwrap_or_else(|e| panic!("generated spec does not parse: {e}\n---\n{spec}"));
         let report = parsed.validate();
@@ -414,7 +435,7 @@ mod tests {
             "system_prompt": "say \"hello\"\nand \\ that",
             "owner_pubkey": "b".repeat(64),
         });
-        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64));
+        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni");
         let parsed = hive_spec::AgentSpec::from_toml(&spec)
             .unwrap_or_else(|e| panic!("quoting broke the spec: {e}\n---\n{spec}"));
         assert!(parsed.agent.system_prompt.unwrap().contains('"'));

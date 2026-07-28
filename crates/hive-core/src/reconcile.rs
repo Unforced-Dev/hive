@@ -31,6 +31,9 @@ pub enum Readiness {
     Ready,
     /// Broker keys the agent needs that the broker does not hold.
     MissingCredentials(Vec<String>),
+    /// This spec conflicts with another one. Held rather than dropped, so a bad
+    /// new spec cannot tear down a working agent — see [`HoldReason::Conflict`].
+    Conflict(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +63,14 @@ pub enum HoldReason {
     CrashLooping { restarts: u32, exit_code: Option<i64> },
     /// Starting the agent would produce one that runs and cannot work.
     MissingCredentials(Vec<String>),
+    /// Two specs disagree in a way that makes both unsafe to act on — the same
+    /// identity on the same relay, for instance.
+    ///
+    /// HELD, not removed. Dropping the conflicting specs entirely would make
+    /// them look deleted to the reconciler, which would then tear down a
+    /// container that had been running correctly for weeks. A typo in a new file
+    /// must not take down a working agent.
+    Conflict(String),
 }
 
 impl Action {
@@ -95,12 +106,22 @@ pub fn plan(desired: &[Desired], observed: &[Observed]) -> Vec<Action> {
         // starts without its credentials does not fail — it comes up, joins the
         // relay, and answers wrongly or not at all. That is much harder to
         // attribute than a deploy that refuses with a named missing key.
-        if let Readiness::MissingCredentials(keys) = &d.readiness {
-            actions.push(Action::Hold {
-                agent: d.name.clone(),
-                reason: HoldReason::MissingCredentials(keys.clone()),
-            });
-            continue;
+        match &d.readiness {
+            Readiness::MissingCredentials(keys) => {
+                actions.push(Action::Hold {
+                    agent: d.name.clone(),
+                    reason: HoldReason::MissingCredentials(keys.clone()),
+                });
+                continue;
+            }
+            Readiness::Conflict(why) => {
+                actions.push(Action::Hold {
+                    agent: d.name.clone(),
+                    reason: HoldReason::Conflict(why.clone()),
+                });
+                continue;
+            }
+            Readiness::Ready => {}
         }
 
         match existing {
@@ -333,6 +354,35 @@ mod tests {
             [Action::Hold { reason: HoldReason::MissingCredentials(_), .. }]
         ));
         assert!(!a[0].is_destructive());
+    }
+
+    #[test]
+    fn a_conflicting_spec_is_held_and_never_removes_a_running_container() {
+        // Two specs claiming one identity on one relay. Both are held. Crucially
+        // NEITHER is removed: dropping them from the desired set would make the
+        // already-running container look deleted, so adding one bad file would
+        // tear down an agent that had been working for weeks.
+        let d = vec![
+            Desired {
+                name: "uni-home".into(),
+                spec_hash: "h1".into(),
+                readiness: Readiness::Conflict("same identity, same relay".into()),
+            },
+            Desired {
+                name: "uni-dupe".into(),
+                spec_hash: "h2".into(),
+                readiness: Readiness::Conflict("same identity, same relay".into()),
+            },
+        ];
+        let actions = plan(&d, &[observed("uni-home", "h1", true, 0)]);
+        assert!(
+            actions.iter().all(|a| matches!(a, Action::Hold { .. })),
+            "a conflict must not create or destroy anything: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| a.is_destructive()),
+            "the running container was torn down by a conflicting NEW spec"
+        );
     }
 
     #[test]

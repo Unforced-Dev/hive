@@ -121,6 +121,41 @@ skills and credentials. Validation refuses a target inside `/home/agent/state`,
 because mounting a shared volume over private state is the exact failure this
 design exists to prevent.
 
+## One identity on several relays
+
+hive never generates a key — you always supply one (`hive secret put nsec/uni`),
+which is also how the Buzz shim ships the key the desktop already made.
+
+`buzz-acp` takes a scalar `BUZZ_RELAY_URL`, so the same agent in two communities
+is genuinely two containers and therefore two specs. They are still ONE identity,
+and the private key should exist in exactly one place — name it explicitly:
+
+```toml
+# uni.toml
+[identity]
+pubkey    = "8f3c…"
+relay_url = "wss://home.example"
+
+# uni-other.toml — same pubkey, same key, different relay
+[identity]
+pubkey     = "8f3c…"
+relay_url  = "wss://other.example"
+credential = "nsec/uni"          # defaults to nsec/<file-name>
+```
+
+Without `credential` the key name follows the file name, and you would store the
+same private key twice — where one copy goes stale the first time you rotate it.
+
+Each relay-instance still gets its own container, network and state volume. Share
+files between them with a `[[volume]]` if you want that; skills and harness state
+stay separate unless you say otherwise.
+
+**The same identity on the SAME relay is refused.** Two processes would answer as
+one agent: every mention gets two replies, both charged to the owner, interleaved
+in the thread — which reads as the model repeating itself rather than as a
+deployment mistake. Both specs are *held*, never removed, so adding a bad file
+cannot tear down an agent that was already running.
+
 ## Switching a model or harness
 
 Edit the spec. hive replaces the container; the agent keeps its pubkey, its state

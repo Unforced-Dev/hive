@@ -117,6 +117,16 @@ pub fn validate(spec: &AgentSpec) -> ValidationReport {
         );
     }
 
+    if let Some(c) = &spec.identity.credential
+        && looks_like_a_secret(c)
+    {
+        r.errors.push(ValidationError::new(
+            "identity.credential",
+            "this is a broker KEY, not the private key itself — store the value with \
+             `hive secret put` and name it here",
+        ));
+    }
+
     // ---- harness ----
     match (&spec.harness.id, &spec.harness.command) {
         (None, None) => r.errors.push(ValidationError::new(
@@ -351,6 +361,7 @@ mod tests {
                 relay_url: "wss://buzz.example.org".into(),
                 owner_pubkey: Some(PK.into()),
                 auth_tag: None,
+                credential: None,
             },
             harness: Harness { id: Some("claude".into()), command: None, image: None },
             agent: AgentConfig { observer: true, ..Default::default() },

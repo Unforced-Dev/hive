@@ -186,6 +186,8 @@ fn pass(
         tracing::info!(agent = %name, "broker listener started");
     }
 
+    let conflicts = duplicate_identities(&specs);
+
     // Desired state, with credential readiness resolved up front. An agent whose
     // credentials are missing is HELD rather than started: one that starts
     // without them joins the relay and answers wrongly, which is far harder to
@@ -207,7 +209,12 @@ fn pass(
         desired.push(Desired {
             name: name.clone(),
             spec_hash: spec.hash(),
-            readiness: if missing.is_empty() {
+            // A conflict outranks a missing credential: with two specs claiming
+            // one identity, "which credential is missing" is not the question
+            // worth answering.
+            readiness: if let Some(why) = conflicts.get(name) {
+                Readiness::Conflict(why.clone())
+            } else if missing.is_empty() {
                 Readiness::Ready
             } else {
                 Readiness::MissingCredentials(missing)
@@ -350,6 +357,51 @@ fn load_specs(dir: &Path) -> Result<BTreeMap<String, AgentSpec>> {
         out.insert(name, spec);
     }
     Ok(out)
+}
+
+/// Names of specs that put ONE identity on ONE relay twice.
+///
+/// Sharing an identity across relays is supported and is the point of
+/// `identity.credential` — `buzz-acp` takes a scalar relay URL, so the same
+/// agent in two communities is legitimately two containers.
+///
+/// The same pubkey on the SAME relay is different: two processes answer as one
+/// agent, so every mention gets two replies, both charged to the owner, and the
+/// two turns interleave in the thread. It reads as the model repeating itself
+/// rather than as a deployment mistake, which is why this is worth an explicit
+/// check. No single spec is wrong, so per-spec validation cannot see it.
+///
+/// ALL participants are marked rather than picking a winner: they are
+/// indistinguishable, and choosing by filename order would make the survivor
+/// depend on what the files happen to be called.
+///
+/// They are HELD, not dropped. Dropping them would make an already-running
+/// container look deleted, and the reconciler would tear down an agent that had
+/// been working for weeks because someone added a bad new file next to it.
+fn duplicate_identities(specs: &BTreeMap<String, AgentSpec>) -> HashMap<String, String> {
+    let mut seen: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+    for (name, spec) in specs {
+        seen.entry((&spec.identity.pubkey, &spec.identity.relay_url))
+            .or_default()
+            .push(name);
+    }
+    let mut conflicts = HashMap::new();
+    for ((pubkey, relay), names) in seen {
+        if names.len() > 1 {
+            let why = format!(
+                "the same identity is deployed to relay {relay} by {}. Each mention \
+                 would get one reply per container, all charged to the owner. To run \
+                 one identity on SEVERAL relays, give each spec a different relay_url \
+                 and point them at one key with identity.credential.",
+                names.join(" and ")
+            );
+            tracing::error!(agents = %names.join(", "), pubkey = %pubkey, relay = %relay, "{why}");
+            for n in names {
+                conflicts.insert(n.to_string(), why.clone());
+            }
+        }
+    }
+    conflicts
 }
 
 // ---------------------------------------------------------------------------

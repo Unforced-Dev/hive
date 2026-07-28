@@ -19,6 +19,12 @@ relay_url = "wss://relay.example"
 # hive refuses to deploy that rather than let you find it later.
 owner_pubkey = "1111111111111111111111111111111111111111111111111111111111111111"
 
+# Broker key holding the secret key. Defaults to nsec/<file-name>.
+# Set it to run ONE identity on SEVERAL relays: buzz-acp takes a scalar relay
+# URL, so that is two spec files and two containers — but one key, which should
+# exist in exactly one place rather than being copied and going stale.
+# credential = "nsec/scribe"
+
 # Preferred over owner_pubkey when you have one: a NIP-OA attestation lets the
 # agent derive relay access from its owner's membership instead of needing its
 # own enrollment.

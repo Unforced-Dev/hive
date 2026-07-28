@@ -60,7 +60,9 @@ pub fn resolve_harness(spec: &AgentSpec) -> Result<&'static HarnessDef, PlanErro
 pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, PlanError> {
     let h = resolve_harness(spec)?;
     let mut reqs = vec![Requirement {
-        key: CredentialKey::new(format!("nsec/{agent}")),
+        // Not derived from the agent name: several specs may share one identity
+        // across relays, and the secret key must live in exactly one place.
+        key: CredentialKey::new(spec.identity.credential_key(agent)),
         // The agent's Nostr identity. Necessarily an env var: buzz-acp reads
         // BUZZ_PRIVATE_KEY at startup and there is no file or helper form.
         delivery: Delivery::Env { var: "BUZZ_PRIVATE_KEY".into() },
@@ -404,6 +406,35 @@ id = "claude"
         s.harness.id = Some("nonesuch".into());
         let msg = resolve_harness(&s).unwrap_err().to_string();
         assert!(msg.contains("grok") && msg.contains("claude"), "got: {msg}");
+    }
+
+    #[test]
+    fn one_identity_can_span_relays_by_naming_a_shared_key() {
+        // buzz-acp takes a scalar BUZZ_RELAY_URL, so the same agent in two
+        // communities is genuinely two containers — but one identity. Without
+        // this the key name follows the file name and the same private key ends
+        // up stored twice, where one copy goes stale on rotation.
+        let mut home = spec_toml("");
+        let mut other = spec_toml("");
+        other.identity.relay_url = "wss://other.example".into();
+        other.identity.credential = Some("nsec/uni".into());
+
+        // Different agent names, because they are different containers.
+        let a = requirements(&home, "uni").unwrap();
+        let b = requirements(&other, "uni-other").unwrap();
+        let key_of = |rs: &[Requirement]| {
+            rs.iter().find(|r| matches!(r.delivery, Delivery::Env { ref var } if var == "BUZZ_PRIVATE_KEY"))
+                .unwrap().key.0.clone()
+        };
+        assert_eq!(key_of(&a), "nsec/uni");
+        assert_eq!(key_of(&b), "nsec/uni", "the second relay must reuse the same key");
+
+        // ...and they are still separate containers with separate state.
+        home.identity.relay_url = "wss://home.example".into();
+        assert_ne!(
+            crate::backend::Names::volume("uni"),
+            crate::backend::Names::volume("uni-other")
+        );
     }
 
     #[test]

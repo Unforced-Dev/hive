@@ -106,6 +106,37 @@ pub struct Identity {
     /// rather than needing its own enrollment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_tag: Option<String>,
+
+    /// Broker key holding the secret key. Defaults to `nsec/<agent-name>`.
+    ///
+    /// Set it to put ONE identity on SEVERAL RELAYS. `buzz-acp` takes a scalar
+    /// `BUZZ_RELAY_URL`, so the same agent in two communities is genuinely two
+    /// processes and therefore two specs — but they are one identity, and the
+    /// secret key should exist in exactly one place. Without this the key name
+    /// follows the file name, and you would store the same private key twice
+    /// under two names, where one copy inevitably goes stale on rotation.
+    ///
+    /// ```toml
+    /// # uni.toml
+    /// [identity]
+    /// pubkey = "8f3c…"
+    /// relay_url = "wss://home.example"
+    ///
+    /// # uni-other.toml — same pubkey, same key, different relay
+    /// [identity]
+    /// pubkey = "8f3c…"
+    /// relay_url = "wss://other.example"
+    /// credential = "nsec/uni"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+impl Identity {
+    /// The broker key holding this agent's secret key.
+    pub fn credential_key(&self, agent: &str) -> String {
+        self.credential.clone().unwrap_or_else(|| format!("nsec/{agent}"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
