@@ -69,9 +69,15 @@ pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, P
         purpose: "the agent's Nostr identity; without it it cannot join the relay at all",
     }];
 
-    // The model-provider credential for this harness. The first name in the
-    // catalog's list is the preferred one.
-    if let Some(var) = h.credential_env.first() {
+    // The model-provider credential, but only when it is actually an env var.
+    // Codex subscription auth is a file with no env form, and an interactively
+    // logged-in harness keeps its credential in the state volume — demanding a
+    // broker key in those cases holds the agent forever waiting for something
+    // that will never exist, and holds it so hard you cannot start a container
+    // to log in.
+    if spec.harness.auth == hive_spec::HarnessAuth::Broker
+        && let Some(var) = h.credential_env.first()
+    {
         reqs.push(Requirement {
             key: CredentialKey::new(format!("harness/{}", h.id)),
             delivery: Delivery::Env { var: (*var).to_string() },
@@ -435,6 +441,32 @@ id = "claude"
             crate::backend::Names::volume("uni"),
             crate::backend::Names::volume("uni-other")
         );
+    }
+
+    #[test]
+    fn file_and_interactive_auth_do_not_demand_a_broker_key() {
+        // The trap this closes: codex subscription auth is a JSON file with no
+        // env-var form, so requiring harness/codex held the agent forever — and
+        // held it so hard you could not start a container to log in.
+        let mut s = spec_toml("");
+        s.harness.id = Some("codex".into());
+
+        let broker = requirements(&s, "a").unwrap();
+        assert!(broker.iter().any(|r| r.key.as_str() == "harness/codex"));
+
+        s.harness.auth = hive_spec::HarnessAuth::File;
+        let file = requirements(&s, "a").unwrap();
+        assert!(!file.iter().any(|r| r.key.as_str() == "harness/codex"));
+
+        s.harness.auth = hive_spec::HarnessAuth::Interactive;
+        let inter = requirements(&s, "a").unwrap();
+        assert!(!inter.iter().any(|r| r.key.as_str() == "harness/codex"));
+
+        // The agent identity is still required in every case — without it the
+        // agent cannot reach the relay at all.
+        for reqs in [&file, &inter] {
+            assert!(reqs.iter().any(|r| r.key.as_str() == "nsec/a"));
+        }
     }
 
     #[test]

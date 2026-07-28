@@ -151,6 +151,36 @@ pub struct Harness {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+
+    /// Where this harness's MODEL credential comes from. Default `broker`.
+    ///
+    /// Not every harness authenticates with an environment variable. Codex's
+    /// subscription auth is a JSON file with no env-var form at all; Claude and
+    /// grok can be logged in interactively inside the container, where the
+    /// credential lands in the state volume and never passes through hive.
+    ///
+    /// Without this hive would demand a `harness/<id>` broker key in every case
+    /// and hold the agent forever waiting for a credential that is never going
+    /// to exist — including, awkwardly, holding it so hard you cannot start the
+    /// container to log in.
+    #[serde(default)]
+    pub auth: HarnessAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HarnessAuth {
+    /// A `harness/<id>` key in the broker, delivered as an environment variable.
+    #[default]
+    Broker,
+    /// A `[[file]]` entry supplies it — codex's `auth.json`. hive still checks
+    /// that file's credential exists, so a missing one is caught.
+    File,
+    /// You log in inside the container (`hive shell --scratch <agent>`), and the
+    /// credential lives in the state volume. hive requires nothing and cannot
+    /// verify it — the agent will start and fail on its first turn if you have
+    /// not logged in yet, which is the price of the flow.
+    Interactive,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
