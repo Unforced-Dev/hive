@@ -82,6 +82,7 @@ sudo cp packaging/hived.service /etc/systemd/system/ && sudo systemctl enable --
 `hive doctor` checks the things that are usually wrong.
 
 **Docs:** [ARCHITECTURE](docs/ARCHITECTURE.md) — what it is and how it works ·
+[DECISIONS](docs/DECISIONS.md) — why, and what was rejected ·
 [TESTING](docs/TESTING.md) — a hands-on walkthrough against a real relay
 
 ## Getting inside a container
