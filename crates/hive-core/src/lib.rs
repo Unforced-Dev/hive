@@ -8,7 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod credential;
 pub mod harness;
+pub mod mcp;
 pub mod network;
 
 pub use harness::{HarnessDef, ModelSyntax, Unsupported};

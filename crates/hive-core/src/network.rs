@@ -48,7 +48,7 @@ pub enum Allowed {
 }
 
 impl Allowed {
-    fn port(&self) -> u16 {
+    pub fn port(&self) -> u16 {
         match self {
             Self::HostProcess { port, .. } | Self::PublishedPort { port, .. } => *port,
         }
