@@ -54,6 +54,29 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         lines: usize,
     },
+    /// Open a shell in an agent's container.
+    ///
+    /// `--scratch` starts a SEPARATE container from the same image with this
+    /// agent's state volume mounted, and no relay connection. That is the one to
+    /// use for an interactive login (`codex login`, `claude setup-token`): the
+    /// credential lands in the volume and survives, and the reconciler cannot
+    /// replace the container underneath you mid-flow. It also works when the
+    /// agent itself is crash-looping and `exec` would fail.
+    Shell {
+        agent: String,
+        /// A side container instead of the running agent.
+        #[arg(long)]
+        scratch: bool,
+        /// Command to run instead of an interactive shell.
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Remove an agent's container so the next reconcile recreates it.
+    ///
+    /// Config and credentials are injected between create and start, so this is
+    /// how a harness picks up a credential you added by hand. The state volume
+    /// is untouched.
+    Restart { agent: String },
     /// Check the things that are usually wrong.
     Doctor,
     /// Manage credentials.
@@ -90,6 +113,10 @@ fn main() -> Result<()> {
         Command::Status => status(&cli.control_socket),
         Command::Ps => ps(),
         Command::Logs { agent, lines } => logs(agent, *lines),
+        Command::Shell { agent, scratch, cmd } => {
+            shell(agent, *scratch, cmd, &cli.image, &cli.spec_dir)
+        }
+        Command::Restart { agent } => restart(agent),
         Command::Doctor => doctor(&cli),
         Command::Secret(c) => secret(&cli.secrets_dir, c),
         Command::Firewall { agent, host_addr, published } => {
@@ -207,6 +234,108 @@ fn ps() -> Result<()> {
 fn logs(agent: &str, lines: usize) -> Result<()> {
     let backend = DockerBackend::discover()?;
     print!("{}", backend.logs(&Names::container(agent), lines)?);
+    Ok(())
+}
+
+/// Replace this process with `docker`, so the terminal is genuinely interactive.
+///
+/// `exec` rather than spawn-and-wait: an interactive login needs a real TTY with
+/// working job control and signal handling, and a wrapper process in between
+/// breaks Ctrl-C in ways that are maddening to debug.
+/// `-i` always, `-t` only when stdin really is a terminal.
+///
+/// Passing `-t` without one fails outright — "cannot attach stdin to a
+/// TTY-enabled container" — which breaks `hive shell agent -- cmd` in scripts
+/// and over non-interactive SSH, the two places you most want it.
+fn tty_flags() -> Vec<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        vec!["-i".into(), "-t".into()]
+    } else {
+        vec!["-i".into()]
+    }
+}
+
+fn exec_docker(args: Vec<String>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new("docker").args(&args).exec();
+    bail!("could not exec docker: {err}")
+}
+
+/// Best-effort spec load. A missing or invalid spec must not stop you getting a
+/// shell — that is very often the situation you need the shell to diagnose.
+fn load_spec(spec_dir: &PathBuf, agent: &str) -> Option<AgentSpec> {
+    let text = std::fs::read_to_string(spec_dir.join(format!("{agent}.toml"))).ok()?;
+    AgentSpec::from_toml(&text).ok()
+}
+
+fn shell(
+    agent: &str,
+    scratch: bool,
+    cmd: &[String],
+    image: &str,
+    spec_dir: &PathBuf,
+) -> Result<()> {
+    let container = Names::container(agent);
+    let shell_cmd: Vec<String> = if cmd.is_empty() {
+        vec!["bash".into()]
+    } else {
+        cmd.to_vec()
+    };
+
+    if !scratch {
+        let mut args = vec!["exec".to_string()];
+        args.extend(tty_flags());
+        args.push(container.clone());
+        args.extend(shell_cmd);
+        return exec_docker(args);
+    }
+
+    // A side container sharing the agent's state volume. Notably it does NOT
+    // carry the agent's identity or model credentials: this is for logging in
+    // and looking around, not for impersonating the agent. Anything written
+    // under /home/agent/state persists and the agent picks it up on its next
+    // start — `hive restart <agent>` forces that.
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    args.extend(tty_flags());
+    args.extend([
+        "-v".into(),
+        format!("{}:/home/agent/state", Names::volume(agent)),
+        // Shares the agent's network, so anything reachable from the agent is
+        // reachable here — and nothing else is.
+        "--network".into(),
+        Names::network(agent),
+        "--entrypoint".into(),
+        "/usr/local/bin/hive-entrypoint".into(),
+    ]);
+
+    // Mount the agent's shared volumes too. Without these you are looking at a
+    // DIFFERENT filesystem than the agent sees, which is worse than no shell at
+    // all: you would debug a working tree the agent never had.
+    if let Some(spec) = load_spec(spec_dir, agent) {
+        for v in &spec.volumes {
+            args.push("-v".into());
+            let ro = if v.read_only { ":ro" } else { "" };
+            args.push(format!("{}:{}{}", v.name, v.target, ro));
+        }
+    }
+
+    args.push(image.to_string());
+    args.extend(shell_cmd);
+
+    eprintln!("scratch container on {}'s state volume.", agent);
+    eprintln!("anything you write under /home/agent/state persists;");
+    eprintln!("run `hive restart {agent}` afterwards so the harness picks it up.\n");
+    exec_docker(args)
+}
+
+fn restart(agent: &str) -> Result<()> {
+    let backend = DockerBackend::discover()?;
+    // Removed, not restarted. Config and credentials are injected between create
+    // and start, so `docker restart` would reuse whatever was injected last
+    // time — which after a credential rotation is a stale secret.
+    backend.remove(&Names::container(agent))?;
+    println!("removed {}; hived will recreate it on its next pass", Names::container(agent));
     Ok(())
 }
 

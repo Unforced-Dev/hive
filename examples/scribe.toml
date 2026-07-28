@@ -80,3 +80,33 @@ credential = "mcp/parachute"
 # redeploy destroys them.
 [env]
 TZ = "UTC"
+
+# ---------------------------------------------------------------------------
+# Credential FILES, for credentials with no environment-variable form.
+# codex's subscription auth is the case that matters. The value lives in the
+# broker (`hive secret put codex/auth < ~/.codex/auth.json`); this names it.
+#
+# Unlike env delivery, a file is NOT visible to `docker inspect`. The target
+# must be inside /home/agent/state or it is destroyed on the next redeploy.
+# ---------------------------------------------------------------------------
+# [[file]]
+# credential = "codex/auth"
+# target     = "/home/agent/state/codex/auth.json"
+# mode       = "0600"          # a STRING: TOML has no octal, and `mode = 0600`
+#                              # parses as decimal 600, which is world-writable
+
+# ---------------------------------------------------------------------------
+# SHARED volumes, for two agents working on one tree.
+#
+# The agent's own state volume (/home/agent/state) is always mounted, is never
+# shared, and holds its skills, credentials and per-harness config. These sit
+# alongside it. Two agents naming the same volume see the same files while
+# keeping entirely separate state — which is how a Claude agent and a Codex
+# agent can edit one repo without sharing a .claude directory.
+#
+# Validation refuses a target inside /home/agent/state.
+# ---------------------------------------------------------------------------
+# [[volume]]
+# name   = "uni-workspace"
+# target = "/home/agent/work"
+# read_only = false

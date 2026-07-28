@@ -236,7 +236,85 @@ pub fn validate(spec: &AgentSpec) -> ValidationReport {
         }
     }
 
+    // ---- credential files ----
+    for f in &spec.files {
+        if !f.target.starts_with(STATE_MOUNT) {
+            // Outside the volume the file lives on the container filesystem and
+            // is destroyed on the next recreate. The agent comes back
+            // unauthenticated, hours later, for reasons nobody connects to the
+            // spec edit that caused it.
+            r.errors.push(ValidationError::new(
+                "file.target",
+                format!(
+                    "{} is outside {STATE_MOUNT}: it would be destroyed on the next \
+                     redeploy and the agent would silently revert to unauthenticated",
+                    f.target
+                ),
+            ));
+        }
+        if looks_like_a_secret(&f.credential) {
+            r.errors.push(ValidationError::new(
+                "file.credential",
+                "this is a broker KEY, not the secret itself — store the value with \
+                 `hive secret put` and name it here",
+            ));
+        }
+        if f.mode_bits() & 0o077 != 0 {
+            r.errors.push(ValidationError::new(
+                "file.mode",
+                format!(
+                    "mode {} lets other users in the container read a credential; \
+                     use 0600",
+                    f.mode
+                ),
+            ));
+        }
+    }
+
+    // ---- shared volumes ----
+    for v in &spec.volumes {
+        if v.target.starts_with(STATE_MOUNT) {
+            // Mounting over the state volume replaces every harness's config
+            // and credentials with someone else's — the exact opposite of the
+            // per-agent isolation the state volume exists to provide.
+            r.errors.push(ValidationError::new(
+                "volume.target",
+                format!(
+                    "{} is inside {STATE_MOUNT}, which is this agent's PRIVATE state. \
+                     Mounting a shared volume there would give every agent that names \
+                     it the same skills, credentials and harness state.",
+                    v.target
+                ),
+            ));
+        }
+        if !v.target.starts_with('/') {
+            r.errors.push(ValidationError::new(
+                "volume.target",
+                format!("{} must be an absolute path", v.target),
+            ));
+        }
+        if v.name.trim().is_empty() {
+            r.errors.push(ValidationError::new("volume.name", "must not be empty"));
+        }
+    }
+
     r
+}
+
+/// Where the agent's private state volume is mounted. Duplicated from
+/// `hive-core::backend` rather than imported: this crate deliberately depends on
+/// nothing, and the value is part of the on-disk contract either way.
+const STATE_MOUNT: &str = "/home/agent/state";
+
+/// Heuristic for "someone pasted the actual secret here".
+fn looks_like_a_secret(s: &str) -> bool {
+    // Broker keys are short paths like `codex/auth`. Real credentials are long,
+    // or carry a recognisable prefix.
+    s.len() > 60
+        || s.starts_with("nsec1")
+        || s.starts_with("sk-")
+        || s.starts_with("ey")
+        || s.contains("BEGIN ")
 }
 
 /// Heuristic for a pasted secret where a key was expected. Broker keys look
@@ -279,6 +357,8 @@ mod tests {
             resources: Resources::default(),
             network: Network::default(),
             mcp: vec![],
+            files: vec![],
+            volumes: vec![],
             env: BTreeMap::new(),
         }
     }
@@ -321,6 +401,94 @@ mod tests {
             s.env.insert(k.into(), "/tmp/wrong".into());
             assert!(!s.validate().is_ok(), "{k} should be reserved");
         }
+    }
+
+    #[test]
+    fn a_shared_volume_cannot_be_mounted_over_private_agent_state() {
+        // THE isolation rule. /home/agent/state holds this agent's skills,
+        // credentials and per-harness config. A shared volume mounted there
+        // would give every agent naming it the same .claude, .codex, .grok and
+        // .kimi — which is exactly what per-agent volumes exist to prevent.
+        let mut s = base();
+        s.volumes.push(SharedVolume {
+            name: "team".into(),
+            target: "/home/agent/state/claude".into(),
+            read_only: false,
+        });
+        let r = validate(&s);
+        assert!(
+            r.errors.iter().any(|e| e.to_string().contains("PRIVATE state")),
+            "sharing agent state was allowed: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn a_shared_workspace_outside_state_is_fine() {
+        // The supported shape: two agents, different harnesses, one tree of
+        // files, separate skills and credentials.
+        let mut s = base();
+        s.volumes.push(SharedVolume {
+            name: "uni-workspace".into(),
+            target: "/home/agent/work".into(),
+            read_only: false,
+        });
+        assert!(validate(&s).is_ok(), "{:?}", validate(&s).errors);
+    }
+
+    #[test]
+    fn a_credential_file_outside_the_state_volume_is_refused() {
+        // Written to the container filesystem it is destroyed on the next
+        // recreate, and the agent comes back unauthenticated hours later for
+        // reasons nobody connects to the spec edit.
+        let mut s = base();
+        s.files.push(CredentialFile {
+            credential: "codex/auth".into(),
+            target: "/home/agent/.codex/auth.json".into(),
+            mode: "0600".into(),
+        });
+        let r = validate(&s);
+        assert!(
+            r.errors.iter().any(|e| e.to_string().contains("destroyed on the next redeploy")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn a_permissive_credential_file_mode_is_refused() {
+        let mut s = base();
+        s.files.push(CredentialFile {
+            credential: "codex/auth".into(),
+            target: "/home/agent/state/codex/auth.json".into(),
+            mode: "0644".into(),
+        });
+        assert!(!validate(&s).is_ok());
+    }
+
+    #[test]
+    fn file_mode_is_a_string_so_0600_does_not_become_decimal_600() {
+        // TOML has no octal literal. `mode = 0600` parses as the integer 600,
+        // which is 0o1130 — world-writable. Keeping it a string is the fix, and
+        // this pins it.
+        let f = CredentialFile {
+            credential: "codex/auth".into(),
+            target: "/home/agent/state/codex/auth.json".into(),
+            mode: "0600".into(),
+        };
+        assert_eq!(f.mode_bits(), 0o600);
+        assert_ne!(f.mode_bits(), 600);
+    }
+
+    #[test]
+    fn a_literal_secret_in_a_file_entry_is_refused() {
+        let mut s = base();
+        s.files.push(CredentialFile {
+            credential: "sk-ant-oat01-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            target: "/home/agent/state/codex/auth.json".into(),
+            mode: "0600".into(),
+        });
+        assert!(!validate(&s).is_ok(), "a pasted secret was accepted as a broker key");
     }
 
     #[test]

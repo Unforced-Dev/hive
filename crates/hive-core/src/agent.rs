@@ -77,6 +77,17 @@ pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, P
         });
     }
 
+    // Credential files. Not visible to `docker inspect`, which is why codex's
+    // auth.json is delivered this way rather than flattened into an env var —
+    // and it has no env form anyway.
+    for f in &spec.files {
+        reqs.push(Requirement {
+            key: CredentialKey::new(f.credential.clone()),
+            delivery: Delivery::File { path: f.target.clone().into(), mode: f.mode_bits() },
+            purpose: "a credential file the harness reads at startup",
+        });
+    }
+
     // MCP credentials. On Claude these go through the broker and never enter the
     // container; everywhere else they must be injected.
     for m in &spec.mcp {
@@ -227,13 +238,16 @@ pub fn config_files(spec: &AgentSpec, h: &HarnessDef) -> Result<Vec<InjectFile>,
 
 /// Assemble the full container plan.
 ///
-/// `secrets` are the resolved credential values, keyed by environment variable
-/// name. They are merged last and are the only secrets this function sees.
+/// `secrets` are resolved credential values keyed by ENVIRONMENT VARIABLE name;
+/// `secret_files` are resolved credential values keyed by BROKER KEY, for the
+/// `[[file]]` entries. Both are merged last and are the only secrets this
+/// function sees.
 pub fn container_plan(
     spec: &AgentSpec,
     agent: &str,
     image: &str,
     secrets: BTreeMap<String, String>,
+    secret_files: &BTreeMap<String, Vec<u8>>,
     broker_socket_dir: Option<&std::path::PathBuf>,
 ) -> Result<ContainerPlan, PlanError> {
     let h = resolve_harness(spec)?;
@@ -241,6 +255,18 @@ pub fn container_plan(
     env.extend(secrets);
 
     let mut volumes = standard_volumes(agent);
+
+    // Shared workspaces. The agent's own state volume is always present and
+    // never shared; these sit alongside it, which is what lets two agents with
+    // different harnesses edit one tree while keeping separate skills and
+    // credentials. Validation refuses a target inside the state mount.
+    for v in &spec.volumes {
+        volumes.push(VolumeMount {
+            source: v.name.clone(),
+            target: v.target.clone(),
+            read_only: v.read_only,
+        });
+    }
     // Mounted only when this agent actually has broker-delivered credentials.
     // An unnecessary socket in the container is one more thing reachable by
     // model-authored code.
@@ -264,7 +290,24 @@ pub fn container_plan(
         memory: spec.resources.memory.clone(),
         cpus: spec.resources.cpus,
         pids_limit: spec.resources.pids,
-        inject: config_files(spec, h)?,
+        inject: {
+            let mut files = config_files(spec, h)?;
+            // Credential files, injected between create and start like every
+            // other file. A missing one is skipped rather than fatal: readiness
+            // was already checked, so it means the credential vanished mid-pass,
+            // and the agent is held on the next pass rather than started with a
+            // half-written credential.
+            for f in &spec.files {
+                if let Some(bytes) = secret_files.get(&f.credential) {
+                    files.push(InjectFile::for_agent(
+                        f.target.clone(),
+                        bytes.clone(),
+                        f.mode_bits(),
+                    ));
+                }
+            }
+            files
+        },
     })
 }
 
@@ -400,7 +443,7 @@ id = "claude"
         // An unused socket is one more thing reachable by model-authored code.
         let s = spec_toml("");
         let dir = std::path::PathBuf::from("/run/hive");
-        let plan = container_plan(&s, "alice", "img", BTreeMap::new(), Some(&dir)).unwrap();
+        let plan = container_plan(&s, "alice", "img", BTreeMap::new(), &BTreeMap::new(), Some(&dir)).unwrap();
         assert!(
             !plan.volumes.iter().any(|v| v.target == BROKER_SOCKET_IN_CONTAINER),
             "no MCP credentials, so no socket"
@@ -411,7 +454,7 @@ id = "claude"
     fn the_spec_hash_reaches_the_container_labels() {
         // The reconciler's entire change-detection rests on this round-trip.
         let s = spec_toml("");
-        let plan = container_plan(&s, "alice", "img", BTreeMap::new(), None).unwrap();
+        let plan = container_plan(&s, "alice", "img", BTreeMap::new(), &BTreeMap::new(), None).unwrap();
         assert_eq!(
             plan.labels.get(crate::backend::LABEL_SPEC_HASH),
             Some(&s.hash())

@@ -32,9 +32,63 @@ pub struct AgentSpec {
     /// literal secrets — see [`Mcp::credential`].
     #[serde(default, rename = "mcp")]
     pub mcp: Vec<Mcp>,
+    /// Credential FILES to place inside the container before it starts.
+    ///
+    /// For credentials with no environment-variable form — codex's `auth.json`
+    /// being the one that matters, since its subscription auth cannot be
+    /// expressed as an env var. Each names a broker key, never a literal secret,
+    /// and lands inside the agent's own state volume.
+    #[serde(default, rename = "file")]
+    pub files: Vec<CredentialFile>,
+
+    /// Extra volumes, for sharing a workspace between agents.
+    ///
+    /// The agent's own state volume is always mounted and is never shared.
+    /// These are additional: two agents naming the same volume see the same
+    /// files, which is how a Claude agent and a Codex agent can work on one tree
+    /// while keeping separate skills, credentials and harness state.
+    #[serde(default, rename = "volume")]
+    pub volumes: Vec<SharedVolume>,
+
     /// Non-secret environment only. Validated against a deny-list.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CredentialFile {
+    /// A *broker key* (e.g. `codex/auth`), never a literal secret.
+    pub credential: String,
+    /// Absolute path inside the container. Must be under the state volume, or
+    /// the file is written to the container filesystem and destroyed on the next
+    /// recreate — after which the agent silently reverts to unauthenticated.
+    pub target: String,
+    /// Octal, as a STRING so `0600` survives TOML instead of being read as the
+    /// decimal integer 600 (which is 0o1130 — world-writable).
+    #[serde(default = "default_file_mode")]
+    pub mode: String,
+}
+
+fn default_file_mode() -> String {
+    "0600".into()
+}
+
+impl CredentialFile {
+    /// Parsed mode, falling back to 0600 rather than to something permissive.
+    /// A typo must never widen access to a credential.
+    pub fn mode_bits(&self) -> u32 {
+        u32::from_str_radix(self.mode.trim_start_matches("0o"), 8).unwrap_or(0o600)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SharedVolume {
+    /// Docker volume name. Agents naming the same volume share its contents.
+    pub name: String,
+    /// Absolute mount point inside the container.
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

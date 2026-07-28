@@ -232,7 +232,8 @@ fn pass(
             .get(name)
             .ok_or_else(|| reconcile::ApplyError::NoPlanFor(name.to_string()))?;
         let secrets = resolve_secrets(broker, spec, name);
-        agent::container_plan(spec, name, &args.image, secrets, Some(&args.socket_dir))
+        let files = resolve_secret_files(broker, spec, name);
+        agent::container_plan(spec, name, &args.image, secrets, &files, Some(&args.socket_dir))
             .map_err(|e| reconcile::ApplyError::NoPlanFor(format!("{name}: {e}")))
     });
 
@@ -270,6 +271,29 @@ fn resolve_secrets(broker: &Broker, spec: &AgentSpec, name: &str) -> BTreeMap<St
             // the credential vanished mid-pass. The agent is held on the next
             // pass rather than started half-configured.
             Err(e) => tracing::error!(key = %r.key.0, error = %e, "credential unavailable"),
+        }
+    }
+    out
+}
+
+/// Fetch credentials delivered as FILES, keyed by broker key.
+///
+/// Kept separate from the env path because these are bytes, not strings: codex's
+/// auth.json is JSON, and round-tripping it through a String would corrupt any
+/// credential that is not valid UTF-8.
+fn resolve_secret_files(
+    broker: &Broker,
+    spec: &AgentSpec,
+    name: &str,
+) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for f in &spec.files {
+        let key = hive_core::credential::CredentialKey::new(f.credential.clone());
+        match broker.fetch(name, &key) {
+            Ok(secret) => {
+                out.insert(f.credential.clone(), secret.expose().to_vec());
+            }
+            Err(e) => tracing::error!(key = %f.credential, error = %e, "credential file unavailable"),
         }
     }
     out

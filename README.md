@@ -81,6 +81,53 @@ sudo cp packaging/hived.service /etc/systemd/system/ && sudo systemctl enable --
 
 `hive doctor` checks the things that are usually wrong.
 
+## Getting inside a container
+
+```console
+$ hive shell <agent>              # exec into the running agent
+$ hive shell --scratch <agent>    # side container on the agent's volumes
+$ hive restart <agent>            # drop the container; hived recreates it
+```
+
+`--scratch` is the one for an interactive login (`codex login`,
+`claude setup-token`). It starts a separate container from the same image with
+the agent's state volume *and* its shared volumes mounted, on the agent's
+network, with no relay connection — so the reconciler cannot replace the
+container underneath you mid-flow, and it works when the agent is crash-looping
+and `exec` would fail. Anything written under `/home/agent/state` persists;
+`hive restart` makes the harness pick it up.
+
+## State is per-agent, always
+
+Each agent gets its own Docker volume at `/home/agent/state`, and **every**
+harness state directory lives inside it — `claude`, `codex`, `kimi`, `grok`,
+`amp`, `cursor`, `omp`, `opencode`, plus `config`, `data` and `work`. Harnesses
+that hardcode `$HOME/.foo` get a symlink into the volume, made by the entrypoint.
+
+So an agent's skills, credentials and history are its own. Nothing is shared by
+default. The one shared path is `/opt/grok`, which is the grok *binary* —
+root-owned, read-only to agents, and 127 MB you do not want copied per agent.
+
+To share deliberately, name a volume:
+
+```toml
+[[volume]]
+name   = "uni-workspace"
+target = "/home/agent/work"
+```
+
+Two agents naming the same volume edit the same tree while keeping separate
+skills and credentials. Validation refuses a target inside `/home/agent/state`,
+because mounting a shared volume over private state is the exact failure this
+design exists to prevent.
+
+## Switching a model or harness
+
+Edit the spec. hive replaces the container; the agent keeps its pubkey, its state
+volume and its files, and thread history lives on the relay rather than in the
+container — so the conversation survives. Both harnesses' state persists
+side by side in the volume, so switching back and forth is free.
+
 ## How it hangs together
 
 ```
@@ -117,11 +164,16 @@ each other or my network" and the wrong tool for running code from someone who
 wants in.
 
 **"Credentials never enter the container" is only true for MCP servers, and only
-on Claude Code.** A harness authenticates to its own model API, and there is no
-hook to intercept that — so `CLAUDE_CODE_OAUTH_TOKEN`, codex's `auth.json` and
-`XAI_API_KEY` are injected, and anyone with Docker daemon access can read them
-with `docker inspect`. `headersHelper` is MCP-specific. What hive offers is a
-smaller blast radius, not zero.
+on Claude Code.** A harness authenticates to its own model API and there is no
+hook to intercept that, so model credentials are injected. `headersHelper` is
+MCP-specific. What hive offers is a smaller blast radius, not zero. Three tiers,
+worst to best:
+
+| delivery | used for | `docker inspect` sees it? |
+|---|---|---|
+| env | `CLAUDE_CODE_OAUTH_TOKEN`, `XAI_API_KEY` | **yes** |
+| file (`[[file]]`) | codex `auth.json` — no env form exists | no |
+| broker (`[[mcp]]`) | MCP tokens, Claude only | never enters the container |
 
 **Secrets are 0600 files, not encrypted.** Encrypting them with a key stored on
 the same disk protects against nothing an attacker who can read the files cannot
