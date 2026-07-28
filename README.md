@@ -81,6 +81,9 @@ sudo cp packaging/hived.service /etc/systemd/system/ && sudo systemctl enable --
 
 `hive doctor` checks the things that are usually wrong.
 
+**Docs:** [ARCHITECTURE](docs/ARCHITECTURE.md) — what it is and how it works ·
+[TESTING](docs/TESTING.md) — a hands-on walkthrough against a real relay
+
 ## Getting inside a container
 
 ```console
@@ -252,6 +255,27 @@ Tests are named after the failure they prevent, not the function they cover —
 `observer_defaults_on_because_remote_agents_are_otherwise_invisible`,
 `a_crash_looping_agent_is_held_not_recreated`. Almost every one of them is
 scar tissue from something that went wrong on a real box.
+
+## Relationship to Buzz
+
+hive is not a fork, a competitor, or a patch waiting to be upstreamed. It sits
+under Buzz in the stack and is deliberately separable from it.
+
+Buzz is moving fast — ~850 commits a month from a full-time team — and its energy
+is in the surface: the desktop client, search, invites, threads, plus first-party
+agent capability (`buzz-agent`, `buzz-workflow`). Hosting is explicitly out of
+scope; the docs say agents "can run on your laptop, in the cloud, or at the edge".
+
+Two things follow. First, the seam hive fills is real and has stayed open: as of
+v0.5.0 `BackendKind::Provider` still has no open-source implementation, and
+`buzz-acp`'s `McpServer` is still `{name, command, args, env}` — stdio only, no
+`url`, no `headers` — so HTTP MCP servers remain unreachable through the protocol.
+That is why hive writes harness config files directly, and that part *should*
+shrink if upstream adds the variant.
+
+Second, an agent host wants to outlive any one surface. `hive-core` knows about
+ACP, Docker and credentials; "connect to Buzz" is one adapter and one env-var
+mapping. If a second ACP surface appears, hive follows it.
 
 ## Status
 
