@@ -149,6 +149,46 @@ impl DockerBackend {
         let mut buf = Vec::new();
         {
             let mut ar = tar::Builder::new(&mut buf);
+
+            // Parent directories FIRST, with the agent's ownership.
+            //
+            // `docker cp` creates any missing parent as root:root, and the file
+            // inside it then has correct ownership in a directory the agent
+            // cannot write. Harnesses do not fail on the credential — they fail
+            // later trying to write their own state beside it. Codex reports
+            // "failed to initialize sqlite state runtime", which points at
+            // sqlite rather than at a permission bug two layers up.
+            let mut dirs: Vec<String> = Vec::new();
+            for f in files {
+                let mut cur = String::new();
+                for seg in f.path.trim_start_matches('/').split('/').collect::<Vec<_>>()
+                    [..f.path.trim_start_matches('/').split('/').count() - 1]
+                    .iter()
+                {
+                    cur.push_str(seg);
+                    cur.push('/');
+                    if !dirs.contains(&cur) {
+                        dirs.push(cur.clone());
+                    }
+                }
+            }
+            dirs.sort();
+            for d in &dirs {
+                let mut h = tar::Header::new_gnu();
+                h.set_path(d).map_err(BackendError::Io)?;
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_size(0);
+                // 0755, not 0700: harness state directories are traversed by
+                // tools running as the same user, and 0700 on a parent has
+                // surprised us before.
+                h.set_mode(0o755);
+                h.set_uid(InjectFile::AGENT_UID as u64);
+                h.set_gid(InjectFile::AGENT_GID as u64);
+                h.set_mtime(0);
+                h.set_cksum();
+                ar.append(&h, std::io::empty()).map_err(BackendError::Io)?;
+            }
+
             for f in files {
                 let mut h = tar::Header::new_gnu();
                 // Paths in the archive are relative; the copy is rooted at /.

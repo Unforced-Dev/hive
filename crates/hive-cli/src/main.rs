@@ -4,7 +4,7 @@
 //! most of `doctor` are offline, because the moment you need them is usually the
 //! moment something is not running.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -352,13 +352,23 @@ fn secret(dir: &PathBuf, cmd: &SecretCmd) -> Result<()> {
         SecretCmd::Put { key } => {
             // From stdin, never an argument: arguments appear in shell history
             // and in `ps` output for every user on the box.
-            let mut value = String::new();
-            std::io::stdin().read_line(&mut value)?;
-            if value.trim().is_empty() {
+            //
+            // read_to_end, NOT read_line. Credentials are routinely multi-line —
+            // codex's auth.json is pretty-printed JSON — and reading one line
+            // stored a single "{" that looked like a success and failed much
+            // later as an unrelated harness error.
+            let mut value = Vec::new();
+            std::io::stdin().read_to_end(&mut value)?;
+            // Trailing whitespace only: internal newlines are part of a JSON
+            // credential and must survive.
+            while value.last().is_some_and(|b| b.is_ascii_whitespace()) {
+                value.pop();
+            }
+            if value.is_empty() {
                 bail!("refusing to store an empty credential for '{key}'");
             }
-            broker.put(&CredentialKey::new(key.clone()), value.trim().as_bytes())?;
-            println!("stored {key}");
+            broker.put(&CredentialKey::new(key.clone()), &value)?;
+            println!("stored {key} ({} bytes)", value.len());
         }
         SecretCmd::List => {
             // Names only. There is no subcommand that prints a stored value:

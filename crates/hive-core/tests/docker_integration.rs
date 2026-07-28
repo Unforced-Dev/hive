@@ -119,6 +119,43 @@ fn injected_credentials_are_readable_by_the_agent_user() {
 }
 
 #[test]
+fn injecting_into_a_new_subdirectory_leaves_it_writable_by_the_agent() {
+    if !enabled() {
+        eprintln!("skipping: set HIVE_DOCKER_TESTS=1");
+        return;
+    }
+    let b = DockerBackend::discover().expect("docker");
+    let agent = "itest-injdir";
+    cleanup(&b, agent);
+
+    // `docker cp` creates missing parents as root:root. The FILE then has the
+    // right ownership inside a directory the agent cannot write, and the harness
+    // fails later on its own state rather than on the credential — codex reports
+    // "failed to initialize sqlite state runtime", which points at sqlite rather
+    // than at a permission bug two layers up.
+    let file = InjectFile::for_agent(
+        "/home/agent/state/codex/auth.json",
+        br#"{"tokens":{"id":"x"}}"#.to_vec(),
+        0o600,
+    );
+    bring_up(&b, &plan_for(agent, "h1", vec![file]), agent);
+    let c = Names::container(agent);
+
+    let dir = exec(&c, &["stat", "-c", "%U:%G", "/home/agent/state/codex"]);
+    assert!(dir.starts_with("agent:agent"), "parent dir not owned by the agent: {dir}");
+
+    // The actual consequence: can the harness write its own state next to the
+    // credential we injected?
+    let wrote = exec(
+        &c,
+        &["sh", "-c", "touch /home/agent/state/codex/state.sqlite && echo ok"],
+    );
+    assert_eq!(wrote, "ok", "agent cannot write beside its injected credential: {wrote}");
+
+    cleanup(&b, agent);
+}
+
+#[test]
 fn the_state_volume_is_writable_by_the_agent() {
     if !enabled() {
         eprintln!("skipping: set HIVE_DOCKER_TESTS=1");
