@@ -1,0 +1,82 @@
+# An example agent. Copy to /etc/hive/agents/<name>.toml — THE FILE NAME IS THE
+# AGENT NAME, so renaming the file creates a different agent.
+#
+# This file holds no secrets and is meant to be committed. Credentials are
+# referenced by name and resolved by the broker:
+#
+#   hive secret put nsec/scribe    < agent.nsec
+#   hive secret put harness/claude < oauth-token
+#   hive secret put mcp/parachute  < vault-token
+
+[identity]
+# The agent's own Nostr identity. The secret key lives in the broker under
+# nsec/<agent> and never appears here.
+pubkey    = "0000000000000000000000000000000000000000000000000000000000000000"
+relay_url = "wss://relay.example"
+
+# Who owns this agent. Without an owner_pubkey or auth_tag the agent starts,
+# connects, and responds to nobody — looking completely healthy while doing it.
+# hive refuses to deploy that rather than let you find it later.
+owner_pubkey = "1111111111111111111111111111111111111111111111111111111111111111"
+
+# Preferred over owner_pubkey when you have one: a NIP-OA attestation lets the
+# agent derive relay access from its owner's membership instead of needing its
+# own enrollment.
+# auth_tag = "[\"auth\",\"<owner>\",\"<conditions>\",\"<sig>\"]"
+
+[harness]
+# One of: claude, codex, goose, grok, opencode, kimi, amp, omp, cursor.
+# `hive harnesses` lists them, including the ones this build deliberately refuses
+# and why.
+id = "claude"
+
+[agent]
+system_prompt = "You keep notes for the team. Be brief."
+
+# Harness-specific and NOT portable. Claude wants a bare alias (`opus`) and
+# rejects `opus[1m]`; codex wants `gpt-5.6-sol[high]` where the suffix is
+# reasoning depth. hive normalises per harness.
+model = "sonnet"
+
+# owner-only | allowlist | anyone | nobody.
+# hive also pins this as the ALLOWED set, so the harness refuses to start if
+# something later tries to widen it.
+respond_to = "owner-only"
+
+# Seconds of silence before a turn is killed. Resets on any agent output.
+idle_timeout = 300
+
+# Size of the in-process harness pool: one slot per concurrent CHANNEL, not per
+# subagent. Set it high and every slot runs `initialize` at startup, they time
+# out together, and the agent never answers with nothing in the logs that looks
+# like an error.
+parallelism = 4
+
+# Publish observer frames so the desktop can watch the agent work. ON by default
+# in hive, though the harness defaults it OFF — a local agent is observed over
+# stdio and a container has no stdio to observe, so without this a remote agent
+# works perfectly while appearing to do nothing.
+observer = true
+
+[resources]
+# A CEILING, not a reservation. An idle agent uses ~60 MB. Roomier than one
+# harness needs because an agent may shell out to a second one.
+memory = "3g"
+cpus   = 2.0
+pids   = 512
+
+[[mcp]]
+name      = "parachute"
+transport = "http"
+url       = "https://vault.example/mcp"
+# A NAME the broker resolves, never a literal secret — validation refuses
+# anything that looks like one. On Claude this is served per-connection through
+# hive-headers and never enters the container.
+credential = "mcp/parachute"
+
+# Non-secret environment only. State-directory variables (CLAUDE_CONFIG_DIR,
+# CODEX_HOME, XDG_CONFIG_HOME) are reserved: they point into the mounted volume,
+# and overriding one sends credentials to the container filesystem where a
+# redeploy destroys them.
+[env]
+TZ = "UTC"

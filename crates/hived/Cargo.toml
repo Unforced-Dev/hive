@@ -1,5 +1,6 @@
 [package]
 name = "hived"
+description = "The hive daemon: reconciles agent specs into running containers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,5 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 hive-spec.workspace = true
-anyhow.workspace = true
+hive-core.workspace = true
+hive-broker.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

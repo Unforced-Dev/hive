@@ -291,12 +291,17 @@ pub fn handle_request(broker: &Broker, grant: &Grant, servers: &ServerKeys, line
 /// per MCP connection — and Claude Code's helper timeout is 10 seconds, which is
 /// enormous next to a file read. Concurrency here would be complexity with no
 /// workload to justify it.
-pub fn serve(
-    socket: &Path,
-    broker: &Broker,
-    grant: &Grant,
-    servers: &ServerKeys,
-) -> Result<(), BrokerError> {
+///
+/// `resolve` is consulted PER REQUEST rather than captured once. A listener
+/// outlives any particular version of an agent's spec: grants change when a spec
+/// is edited, and an agent can be deleted entirely while its listener is still
+/// blocked in `accept`. Resolving per request means an edit takes effect
+/// immediately and a deleted agent is denied rather than served from a snapshot
+/// taken at startup.
+pub fn serve<F>(socket: &Path, broker: &Broker, resolve: F) -> Result<(), BrokerError>
+where
+    F: Fn() -> Option<(Grant, ServerKeys)>,
+{
     use std::os::unix::net::UnixListener;
 
     // A stale socket file from a previous run makes bind() fail with EADDRINUSE.
@@ -325,7 +330,13 @@ pub fn serve(
         if BufReader::new(&stream).read_line(&mut line).is_err() {
             continue;
         }
-        let resp = handle_request(broker, grant, servers, line.trim());
+        let resp = match resolve() {
+            Some((grant, servers)) => handle_request(broker, &grant, &servers, line.trim()),
+            // The agent was deleted while this listener was blocked in accept.
+            None => Response::Error {
+                error: "this agent is no longer configured".into(),
+            },
+        };
         let body = serde_json::to_string(&resp)
             .unwrap_or_else(|_| r#"{"error":"failed to serialise response"}"#.to_string());
         let _ = writeln!(stream, "{body}");

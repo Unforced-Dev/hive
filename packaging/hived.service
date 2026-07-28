@@ -1,0 +1,29 @@
+[Unit]
+Description=hive agent daemon
+Documentation=https://github.com/Unforced-Dev/hive
+# Docker must be up before the first reconciliation pass, or hived logs an
+# error and waits for the next interval — harmless, but confusing on boot.
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hived
+Restart=always
+RestartSec=5
+
+# hived talks to the Docker socket and writes the credential store, so it runs
+# privileged. It is not sandboxed further here because anything that can drive
+# Docker can escape most sandboxing anyway — pretending otherwise would be
+# decoration.
+User=root
+
+# The credential store lives here; 0700, enforced by the broker at startup.
+StateDirectory=hive
+RuntimeDirectory=hive
+RuntimeDirectoryMode=0755
+
+Environment=RUST_LOG=hived=info,hive_core=info,hive_broker=info
+
+[Install]
+WantedBy=multi-user.target

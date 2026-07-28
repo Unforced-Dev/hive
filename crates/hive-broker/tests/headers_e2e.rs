@@ -59,9 +59,12 @@ fn a_container_gets_mcp_headers_without_the_secret_ever_entering_it() {
     let sock = socket.clone();
     std::thread::spawn(move || {
         let broker = Broker::open(&store).expect("broker");
-        let grant = Grant::new("etest-headers", ["mcp/parachute".to_string()]);
-        let servers = ServerKeys::from([("parachute".into(), "mcp/parachute".into())]);
-        let _ = serve(&sock, &broker, &grant, &servers);
+        let _ = serve(&sock, &broker, || {
+            Some((
+                Grant::new("etest-headers", ["mcp/parachute".to_string()]),
+                ServerKeys::from([("parachute".into(), "mcp/parachute".into())]),
+            ))
+        });
     });
     // Wait for bind rather than sleeping a fixed amount.
     for _ in 0..100 {
@@ -133,9 +136,12 @@ fn an_agent_cannot_obtain_a_server_outside_its_grant() {
         // The server is CONFIGURED but the grant does NOT include its key —
         // the case where a spec references a credential the agent has no claim
         // to. The broker must refuse even though it holds the secret.
-        let grant = Grant::new("etest-denied", []);
-        let servers = ServerKeys::from([("secret".into(), "mcp/secret".into())]);
-        let _ = serve(&sock, &broker, &grant, &servers);
+        let _ = serve(&sock, &broker, || {
+            Some((
+                Grant::new("etest-denied", []),
+                ServerKeys::from([("secret".into(), "mcp/secret".into())]),
+            ))
+        });
     });
     for _ in 0..100 {
         if socket.exists() {
