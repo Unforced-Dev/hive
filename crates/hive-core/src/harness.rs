@@ -262,6 +262,27 @@ pub fn lookup(id: &str) -> Option<&'static HarnessDef> {
     CATALOG.iter().find(|h| h.id == id)
 }
 
+/// Reverse lookup: find the catalog entry for a concrete invocation.
+///
+/// Buzz's BYOH layer resolves a harness — builtin, preset or user-defined JSON —
+/// down to an `EffectiveHarnessDescriptor { command, args, env }`, and that is
+/// what the desktop sends a provider on deploy. Mapping it back to a catalog id
+/// means a harness picked in the UI resolves to the entry that knows its model
+/// syntax and credential variables, rather than being re-specified by hand.
+///
+/// Args are compared because the same binary can be several harnesses:
+/// `grok agent … stdio` is the ACP entrypoint, `grok` alone is an interactive UI.
+pub fn lookup_by_command(command: &str, args: &[String]) -> Option<&'static HarnessDef> {
+    CATALOG
+        .iter()
+        .find(|h| h.command == command && h.args.len() == args.len()
+            && h.args.iter().zip(args).all(|(a, b)| a == b))
+        // Fall back to the command alone: a desktop preset may add flags the
+        // catalog does not carry, and matching the binary is still much better
+        // than treating a known harness as custom.
+        .or_else(|| CATALOG.iter().find(|h| h.command == command))
+}
+
 /// Ids that can actually be run, for error messages and `hive doctor`.
 pub fn available_ids() -> impl Iterator<Item = &'static str> {
     CATALOG.iter().filter(|h| h.is_available()).map(|h| h.id)
@@ -283,6 +304,20 @@ pub fn required_binaries() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_desktop_resolved_invocation_maps_back_to_the_catalog() {
+        // Buzz sends agent_command/agent_args, not a harness id. Without this
+        // the id has to be re-specified by hand and can disagree with what the
+        // desktop actually picked.
+        let g = lookup_by_command("grok", &["agent".into(), "--always-approve".into(), "stdio".into()]);
+        assert_eq!(g.map(|h| h.id), Some("grok"));
+        assert_eq!(lookup_by_command("claude-agent-acp", &[]).map(|h| h.id), Some("claude"));
+        // Extra flags still resolve to the right harness rather than falling
+        // through to "custom".
+        assert_eq!(lookup_by_command("goose", &["acp".into(), "--verbose".into()]).map(|h| h.id), Some("goose"));
+        assert!(lookup_by_command("something-else", &[]).is_none());
+    }
 
     #[test]
     fn catalog_ids_are_unique() {

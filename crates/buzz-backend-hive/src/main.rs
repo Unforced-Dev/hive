@@ -181,7 +181,19 @@ fn deploy(req: &Value) -> Result<Value> {
         );
     }
 
-    let spec = build_spec(&agent, &cfg, pubkey, relay_url, owner, &identity_key);
+    // BYOH: the desktop resolves the harness — builtin, preset or user-defined
+    // JSON — down to a concrete command and sends it as agent_command/agent_args.
+    // Honour that rather than the provider_config field, or a harness picked in
+    // the UI is silently overridden by a setting the user last touched elsewhere.
+    let cmd = agent.get("agent_command").and_then(Value::as_str).unwrap_or("");
+    let cmd_args: Vec<String> = agent
+        .get("agent_args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let harness = resolve_harness(cmd, &cmd_args, &get("harness"), &mut warnings);
+    let spec = build_spec(&agent, &cfg, pubkey, relay_url, owner, &identity_key, &harness);
 
     // The nsec goes to the broker over SSH stdin, never as an argument:
     // arguments land in shell history and in `ps` output for every user on the
@@ -220,6 +232,42 @@ fn agent_name(display_name: &str, relay_url: &str, primary_relay: Option<&str>) 
     }
 }
 
+/// How the spec should name the harness.
+enum HarnessChoice {
+    /// Resolved to a catalog entry, which knows its model syntax and credentials.
+    Catalog(&'static str),
+    /// A BYOH custom harness the catalog does not know. Expressed as an explicit
+    /// command, which requires an explicit image containing it.
+    Custom { command: String, args: Vec<String> },
+}
+
+/// Map the desktop's resolved invocation onto the catalog.
+fn resolve_harness(
+    command: &str,
+    args: &[String],
+    config_fallback: &str,
+    warnings: &mut Vec<String>,
+) -> HarnessChoice {
+    if command.is_empty() {
+        // Older records, or a create path that never pinned a command.
+        let id = if config_fallback.is_empty() { "claude" } else { config_fallback };
+        return HarnessChoice::Catalog(
+            hive_core::harness::lookup(id).map(|h| h.id).unwrap_or("claude"),
+        );
+    }
+    if let Some(h) = hive_core::harness::lookup_by_command(command, args) {
+        return HarnessChoice::Catalog(h.id);
+    }
+    // A custom harness from the desktop's custom_harnesses/. hive can express it,
+    // but only the image can say whether the binary is actually there — so warn
+    // rather than fail here, and let the container entrypoint report it clearly.
+    warnings.push(format!(
+        "harness '{command}' is not in hive's catalog. The spec will name it explicitly, \
+         but the agent image must contain that binary — check `hive harnesses` on the host."
+    ));
+    HarnessChoice::Custom { command: command.to_string(), args: args.to_vec() }
+}
+
 /// Agent name without the relay suffix. Also the identity key's basis, so the
 /// two cannot drift apart.
 fn slugify(display_name: &str) -> String {
@@ -240,9 +288,9 @@ fn build_spec(
     relay_url: &str,
     owner: &str,
     identity_key: &str,
+    harness: &HarnessChoice,
 ) -> String {
     let s = |k: &str| cfg.get(k).and_then(Value::as_str).unwrap_or("");
-    let harness = if s("harness").is_empty() { "claude" } else { s("harness") };
     let memory = if s("memory").is_empty() { "3g" } else { s("memory") };
     let cpus = cfg.get("cpus").and_then(Value::as_f64).unwrap_or(2.0);
     let observer = cfg.get("observer").and_then(Value::as_bool).unwrap_or(true);
@@ -263,7 +311,19 @@ fn build_spec(
         out.push_str(&format!("owner_pubkey = {}\n", toml_str(owner)));
     }
 
-    out.push_str(&format!("\n[harness]\nid = {}\n", toml_str(harness)));
+    out.push_str("\n[harness]\n");
+    match harness {
+        HarnessChoice::Catalog(id) => out.push_str(&format!("id = {}\n", toml_str(id))),
+        HarnessChoice::Custom { command, args } => {
+            out.push_str(&format!("command = {}\n", toml_str(command)));
+            if !args.is_empty() {
+                let rendered: Vec<String> = args.iter().map(|a| toml_str(a)).collect();
+                out.push_str(&format!("args = [{}]\n", rendered.join(", ")));
+            }
+            // An explicit command requires an explicit image; validation enforces it.
+            out.push_str("image = \"hive-agent:latest\"\n");
+        }
+    }
 
     out.push_str("\n[agent]\n");
     out.push_str(&format!("observer = {observer}\n"));
@@ -272,6 +332,20 @@ fn build_spec(
     }
     if let Some(p) = agent.get("system_prompt").and_then(Value::as_str) {
         out.push_str(&format!("system_prompt = {}\n", toml_str(p)));
+    }
+    // The desktop already sends these; dropping them silently reverts the agent
+    // to harness defaults that do not match what the UI shows.
+    if let Some(r) = agent.get("respond_to").and_then(Value::as_str) {
+        out.push_str(&format!("respond_to = {}\n", toml_str(r)));
+    }
+    if let Some(n) = agent.get("parallelism").and_then(Value::as_u64) {
+        out.push_str(&format!("parallelism = {n}\n"));
+    }
+    if let Some(t) = agent.get("idle_timeout_seconds").and_then(Value::as_u64).filter(|t| *t > 0) {
+        out.push_str(&format!("idle_timeout = {t}\n"));
+    }
+    if let Some(t) = agent.get("max_turn_duration_seconds").and_then(Value::as_u64).filter(|t| *t > 0) {
+        out.push_str(&format!("max_turn_duration = {t}\n"));
     }
 
     out.push_str(&format!("\n[resources]\nmemory = {}\ncpus = {cpus}\npids = 512\n", toml_str(memory)));
@@ -401,7 +475,7 @@ mod tests {
             "relay_url": "wss://relay.example",
             "owner_pubkey": "b".repeat(64),
         });
-        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni");
+        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni", &HarnessChoice::Catalog("claude"));
         assert!(!spec.contains("nsec1verysecret"), "the spec leaked the private key");
         assert!(spec.contains("owner_pubkey"));
     }
@@ -417,7 +491,7 @@ mod tests {
             "owner_pubkey": "b".repeat(64),
         });
         let cfg = json!({ "harness": "claude", "mcp_url": "https://v.example/mcp", "mcp_auth_ref": "mcp/parachute" });
-        let spec = build_spec(&agent, &cfg, &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni");
+        let spec = build_spec(&agent, &cfg, &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni", &HarnessChoice::Catalog("claude"));
         let parsed = hive_spec::AgentSpec::from_toml(&spec)
             .unwrap_or_else(|e| panic!("generated spec does not parse: {e}\n---\n{spec}"));
         let report = parsed.validate();
@@ -435,7 +509,7 @@ mod tests {
             "system_prompt": "say \"hello\"\nand \\ that",
             "owner_pubkey": "b".repeat(64),
         });
-        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni");
+        let spec = build_spec(&agent, &json!({}), &"a".repeat(64), "wss://relay.example", &"b".repeat(64), "nsec/uni", &HarnessChoice::Catalog("claude"));
         let parsed = hive_spec::AgentSpec::from_toml(&spec)
             .unwrap_or_else(|e| panic!("quoting broke the spec: {e}\n---\n{spec}"));
         assert!(parsed.agent.system_prompt.unwrap().contains('"'));
