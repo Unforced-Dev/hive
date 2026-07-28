@@ -82,9 +82,16 @@ enum Command {
     /// Manage credentials.
     #[command(subcommand)]
     Secret(SecretCmd),
-    /// Print the firewall rules for an agent's network, without applying them.
+    /// Print the firewall rules for hive's whole subnet pool, without applying them.
+    ///
+    /// Run this ONCE at setup. Every agent's network is allocated from the pool,
+    /// so these rules cover every agent that will ever exist — there is no
+    /// per-agent firewall step. Pass an agent name to scope the rules to just
+    /// that one instead.
     Firewall {
-        agent: String,
+        /// Scope to a single agent's subnet rather than the whole pool.
+        #[arg(long)]
+        agent: Option<String>,
         /// The host address agents may reach on :443.
         #[arg(long)]
         host_addr: String,
@@ -120,7 +127,7 @@ fn main() -> Result<()> {
         Command::Doctor => doctor(&cli),
         Command::Secret(c) => secret(&cli.secrets_dir, c),
         Command::Firewall { agent, host_addr, published } => {
-            firewall(agent, host_addr, *published)
+            firewall(agent.as_deref(), host_addr, *published)
         }
     }
 }
@@ -368,25 +375,29 @@ fn secret(dir: &PathBuf, cmd: &SecretCmd) -> Result<()> {
     Ok(())
 }
 
-fn firewall(agent: &str, host_addr: &str, published: bool) -> Result<()> {
-    let backend = DockerBackend::discover()?;
-    let net = Names::network(agent);
-    // The subnet has to come from Docker; guessing it produces rules that apply
-    // to nothing while reading as correct.
-    let out = std::process::Command::new("docker")
-        .args([
-            "network",
-            "inspect",
-            &net,
-            "--format",
-            "{{range .IPAM.Config}}{{.Subnet}}{{end}}",
-        ])
-        .output()?;
-    let subnet = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if subnet.is_empty() {
-        bail!("network {net} has no subnet; does the agent exist?");
-    }
-    let _ = backend;
+fn firewall(agent: Option<&str>, host_addr: &str, published: bool) -> Result<()> {
+    // Default to the POOL. Per-agent rules were the original design and it was
+    // wrong: Docker assigns an arbitrary subnet per network, so every new agent
+    // needed its own rules, and an agent whose rules were missing reached the
+    // public internet but never the relay — alive-looking and silent. Allocating
+    // from a pool means these rules are written once and cover every agent.
+    let subnet = match agent {
+        None => network::DEFAULT_SUBNET_POOL.to_string(),
+        Some(a) => {
+            // The subnet must come from Docker; guessing produces rules that
+            // apply to nothing while reading as correct.
+            let net = Names::network(a);
+            let out = std::process::Command::new("docker")
+                .args(["network", "inspect", &net, "--format",
+                       "{{range .IPAM.Config}}{{.Subnet}}{{end}}"])
+                .output()?;
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() {
+                bail!("network {net} has no subnet; does the agent exist?");
+            }
+            s
+        }
+    };
 
     let allow = if published {
         network::Allowed::PublishedPort {
@@ -397,10 +408,17 @@ fn firewall(agent: &str, host_addr: &str, published: bool) -> Result<()> {
     } else {
         network::Allowed::HostProcess { addr: host_addr.to_string(), port: 443 }
     };
-    let policy = network::EgressPolicy { subnet, allow: vec![allow] };
+    let policy = network::EgressPolicy { subnet: subnet.clone(), allow: vec![allow] };
 
-    println!("# egress policy for {agent} ({net})");
-    println!("# review these before running them; hive does not apply them for you.\n");
+    match agent {
+        None => {
+            println!("# egress policy for hive's whole subnet pool ({subnet})");
+            println!("# Run this ONCE. Every agent network is allocated from this pool, so");
+            println!("# these rules cover every agent that will ever exist.");
+        }
+        Some(a) => println!("# egress policy for {a} only ({subnet})"),
+    }
+    println!("# review before running; hive does not touch your firewall for you.\n");
     for r in policy.rules() {
         println!("# {}", r.why);
         println!("{r}\n");
@@ -413,12 +431,12 @@ fn firewall(agent: &str, host_addr: &str, published: bool) -> Result<()> {
 }
 
 fn doctor(cli: &Cli) -> Result<()> {
-    let mut problems = 0;
-    let mut check = |ok: bool, label: &str, detail: &str| {
+    let problems = std::cell::Cell::new(0);
+    let check = |ok: bool, label: &str, detail: &str| {
         if ok {
             println!("  ok    {label}");
         } else {
-            problems += 1;
+            problems.set(problems.get() + 1);
             println!("  FAIL  {label}\n        {detail}");
         }
     };
@@ -476,6 +494,31 @@ fn doctor(cli: &Cli) -> Result<()> {
         );
     }
 
+    println!("\nfirewall");
+    // The failure this catches: an agent reaches the public internet but never
+    // the relay, so it looks alive and simply never connects. Without a rule for
+    // the pool, that is what every new agent does.
+    let rules = std::process::Command::new("iptables")
+        .args(["-L", "INPUT", "-n"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let pool_prefix = network::DEFAULT_SUBNET_POOL.trim_end_matches("0.0/16");
+    if rules.contains(pool_prefix) {
+        println!("  ok    rules present for the agent subnet pool ({})", network::DEFAULT_SUBNET_POOL);
+    } else if rules.is_empty() {
+        println!("  note  could not read iptables (need root?) — cannot verify egress rules");
+    } else {
+        problems.set(problems.get() + 1);
+        println!(
+            "  FAIL  no rules for the agent subnet pool ({})\n\
+             \x20       Agents will reach the public internet but NOT your relay, which\n\
+             \x20       looks like a working agent that never connects. Fix once with:\n\
+             \x20         hive firewall --host-addr <your-host-ip> | grep '^iptables' | sh",
+            network::DEFAULT_SUBNET_POOL
+        );
+    }
+
     println!("\npaths");
     check(
         cli.spec_dir.exists(),
@@ -495,10 +538,10 @@ fn doctor(cli: &Cli) -> Result<()> {
         "the daemon is not running; most other commands still work",
     );
 
-    if problems == 0 {
+    if problems.get() == 0 {
         println!("\nno problems found");
         Ok(())
     } else {
-        bail!("{problems} problem(s) found")
+        bail!("{} problem(s) found", problems.get())
     }
 }

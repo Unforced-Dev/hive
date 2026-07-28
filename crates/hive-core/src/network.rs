@@ -55,6 +55,44 @@ impl Allowed {
     }
 }
 
+/// Default address pool for agent networks.
+///
+/// **Why a pool at all.** Docker assigns an arbitrary free subnet to each new
+/// network, and iptables rules are written per subnet — so with ad-hoc
+/// allocation every new agent needs its own firewall rules, and an agent whose
+/// rules are missing cannot reach the relay while still reaching the public
+/// internet. It looks alive and simply never connects, which is the worst
+/// available failure mode and one an operator hits on their very first agent.
+///
+/// Allocating every agent from a known pool means the rules are written ONCE,
+/// cover every agent that will ever exist, and cannot be forgotten.
+///
+/// 10.88/16 rather than something in 172.16/12: Docker's own default pool lives
+/// there and a collision is silent and confusing. Override with `--subnet-pool`
+/// if 10.88 is taken on your network.
+pub const DEFAULT_SUBNET_POOL: &str = "10.88.0.0/16";
+
+/// Carve the next free `/24` out of a `/16` pool.
+///
+/// Returns `None` when the pool is exhausted (256 agents) rather than wrapping
+/// around and handing out a subnet another agent is already using — two agents
+/// sharing a subnet would silently share a broadcast domain, and `enable_icc`
+/// cannot save you from that.
+pub fn allocate_subnet(pool: &str, used: &[String]) -> Option<String> {
+    let (base, bits) = pool.split_once('/')?;
+    if bits != "16" {
+        return None;
+    }
+    let octets: Vec<&str> = base.split('.').collect();
+    if octets.len() != 4 {
+        return None;
+    }
+    let (a, b) = (octets[0], octets[1]);
+    (0u16..256)
+        .map(|c| format!("{a}.{b}.{c}.0/24"))
+        .find(|candidate| !used.iter().any(|u| u == candidate))
+}
+
 /// The egress policy for one agent network.
 #[derive(Debug, Clone)]
 pub struct EgressPolicy {
@@ -234,6 +272,36 @@ mod tests {
 
     fn rendered(p: &EgressPolicy) -> Vec<String> {
         p.rules().iter().map(|r| r.to_string()).collect()
+    }
+
+    #[test]
+    fn subnets_come_from_a_pool_so_firewall_rules_are_written_once() {
+        // The whole point: rules for the POOL cover every agent that will ever
+        // exist. Ad-hoc Docker allocation means per-agent rules, and an agent
+        // missing them reaches the internet but never the relay — alive-looking
+        // and silent.
+        assert_eq!(allocate_subnet("10.88.0.0/16", &[]).as_deref(), Some("10.88.0.0/24"));
+        let used = vec!["10.88.0.0/24".to_string(), "10.88.1.0/24".to_string()];
+        assert_eq!(allocate_subnet("10.88.0.0/16", &used).as_deref(), Some("10.88.2.0/24"));
+    }
+
+    #[test]
+    fn an_exhausted_pool_returns_none_rather_than_reusing_a_subnet() {
+        // Two agents on one subnet share a broadcast domain, and enable_icc
+        // cannot help — it only isolates within a single bridge.
+        let used: Vec<String> = (0..256).map(|c| format!("10.88.{c}.0/24")).collect();
+        assert_eq!(allocate_subnet("10.88.0.0/16", &used), None);
+    }
+
+    #[test]
+    fn the_pool_is_covered_by_one_rule_set() {
+        // A policy written against the pool CIDR must match every /24 inside it,
+        // which is what makes one-time setup possible.
+        let p = EgressPolicy {
+            subnet: DEFAULT_SUBNET_POOL.to_string(),
+            allow: vec![Allowed::HostProcess { addr: "100.64.0.1".into(), port: 443 }],
+        };
+        assert!(p.rules().iter().all(|r| r.args.contains(&DEFAULT_SUBNET_POOL.to_string())));
     }
 
     #[test]

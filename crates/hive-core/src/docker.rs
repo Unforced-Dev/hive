@@ -200,12 +200,16 @@ impl ContainerBackend for DockerBackend {
         self.inspect(&ids)
     }
 
-    fn ensure_network(&self, name: &str) -> Result<(), BackendError> {
+    fn ensure_network(&self, name: &str, subnet: Option<&str>) -> Result<(), BackendError> {
         if self.exists("network", name) {
             return Ok(());
         }
         let mut args: Vec<String> =
             vec!["network".into(), "create".into(), "--driver".into(), "bridge".into()];
+        if let Some(s) = subnet {
+            args.push("--subnet".into());
+            args.push(s.to_string());
+        }
         for (k, v) in network::network_create_options() {
             args.push("--opt".into());
             args.push(format!("{k}={v}"));
@@ -213,6 +217,25 @@ impl ContainerBackend for DockerBackend {
         args.push(name.into());
         self.run("network create", name, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
         Ok(())
+    }
+
+    fn used_subnets(&self) -> Result<Vec<String>, BackendError> {
+        // EVERY docker network, not just hive's: Docker refuses an overlapping
+        // subnet, so allocating around only our own would fail on a box that
+        // runs anything else.
+        let names = self.run("network ls", "networks", &["network", "ls", "--format", "{{.Name}}"])?;
+        let mut out = Vec::new();
+        for n in names.lines().map(str::trim).filter(|n| !n.is_empty()) {
+            if let Ok(s) = self.run(
+                "network inspect",
+                n,
+                &["network", "inspect", n, "--format", "{{range .IPAM.Config}}{{.Subnet}}{{end}}"],
+            ) && !s.is_empty()
+            {
+                out.push(s);
+            }
+        }
+        Ok(out)
     }
 
     fn ensure_volume(&self, name: &str) -> Result<(), BackendError> {

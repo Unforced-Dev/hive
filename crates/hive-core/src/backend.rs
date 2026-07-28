@@ -118,7 +118,14 @@ pub trait ContainerBackend {
     fn list(&self) -> Result<Vec<Observed>, BackendError>;
 
     /// Create the network if absent, applying the isolation options. Idempotent.
-    fn ensure_network(&self, name: &str) -> Result<(), BackendError>;
+    ///
+    /// `subnet` is allocated from hive's pool so that one set of firewall rules
+    /// covers every agent. Letting Docker choose would mean per-agent rules, and
+    /// an agent whose rules are missing reaches the internet but never the relay.
+    fn ensure_network(&self, name: &str, subnet: Option<&str>) -> Result<(), BackendError>;
+
+    /// Subnets already assigned to hive-managed networks, for pool allocation.
+    fn used_subnets(&self) -> Result<Vec<String>, BackendError>;
 
     fn ensure_volume(&self, name: &str) -> Result<(), BackendError>;
 

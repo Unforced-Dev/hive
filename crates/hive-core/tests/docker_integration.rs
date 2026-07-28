@@ -66,7 +66,10 @@ fn plan_for(agent: &str, hash: &str, inject: Vec<InjectFile>) -> ContainerPlan {
 }
 
 fn bring_up(b: &DockerBackend, plan: &ContainerPlan, agent: &str) {
-    b.ensure_network(&Names::network(agent)).expect("network");
+    // Subnet from hive's pool, avoiding whatever else is on this daemon.
+    let used = b.used_subnets().expect("subnets");
+    let subnet = hive_core::network::allocate_subnet(hive_core::network::DEFAULT_SUBNET_POOL, &used);
+    b.ensure_network(&Names::network(agent), subnet.as_deref()).expect("network");
     b.ensure_volume(&Names::volume(agent)).expect("volume");
     b.create_and_start(plan).expect("create+start");
 }

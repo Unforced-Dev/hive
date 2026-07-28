@@ -192,6 +192,28 @@ pub struct Outcome {
 /// first error leaves the rest of the box in an arbitrary half-state depending on
 /// iteration order, and the second problem is only discovered after the first is
 /// fixed.
+/// Pick a subnet for an agent's network from hive's pool.
+///
+/// `None` once the pool is exhausted; Docker then chooses, and that agent needs
+/// its own firewall rules — which is exactly the situation the pool exists to
+/// avoid, so it is logged loudly.
+fn allocate_for<B: ContainerBackend>(
+    backend: &B,
+    agent: &str,
+) -> Result<Option<String>, ApplyError> {
+    let used = backend.used_subnets()?;
+    let subnet = crate::network::allocate_subnet(crate::network::DEFAULT_SUBNET_POOL, &used);
+    if subnet.is_none() {
+        tracing::error!(
+            agent,
+            pool = crate::network::DEFAULT_SUBNET_POOL,
+            "subnet pool exhausted; Docker will choose a subnet and this agent will \
+             NOT be covered by the pool firewall rules"
+        );
+    }
+    Ok(subnet)
+}
+
 pub fn apply<B, F>(backend: &B, actions: Vec<Action>, mut build: F) -> Vec<Outcome>
 where
     B: ContainerBackend,
@@ -205,7 +227,8 @@ where
         let result: Result<(), ApplyError> = (|| {
             match &action {
                 Action::Create { .. } => {
-                    backend.ensure_network(&Names::network(&agent))?;
+                    let subnet = allocate_for(backend, &agent)?;
+                    backend.ensure_network(&Names::network(&agent), subnet.as_deref())?;
                     backend.ensure_volume(&Names::volume(&agent))?;
                     backend.create_and_start(&build(&agent)?)?;
                 }
@@ -216,7 +239,8 @@ where
                     // reported rather than compounded.
                     let plan = build(&agent)?;
                     backend.remove(&Names::container(&agent))?;
-                    backend.ensure_network(&Names::network(&agent))?;
+                    let subnet = allocate_for(backend, &agent)?;
+                    backend.ensure_network(&Names::network(&agent), subnet.as_deref())?;
                     backend.ensure_volume(&Names::volume(&agent))?;
                     backend.create_and_start(&plan)?;
                 }
