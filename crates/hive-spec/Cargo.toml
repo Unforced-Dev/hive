@@ -1,0 +1,16 @@
+[package]
+name = "hive-spec"
+description = "Agent spec types and validation for hive. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true

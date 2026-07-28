@@ -1,0 +1,4 @@
+# Pinned so a contributor's build matches CI and the container build.
+[toolchain]
+channel = "1.95"
+components = ["rustfmt", "clippy"]

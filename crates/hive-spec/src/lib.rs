@@ -1,0 +1,213 @@
+//! Agent specs: types, parsing, validation.
+//!
+//! This crate does no I/O. It is the one thing every other crate depends on,
+//! and the dependency direction is strictly downward into it.
+//!
+//! Nearly every validation rule here exists because the behaviour it prevents
+//! was observed in production and cost real time to diagnose. Each one carries
+//! the reason, and each has a test. They are not stylistic.
+
+#![forbid(unsafe_code)]
+
+use std::collections::BTreeMap;
+
+pub mod validate;
+
+pub use validate::{ValidationError, ValidationReport};
+
+/// A complete agent definition. One TOML file per agent; files are the single
+/// source of truth. Observed state (container ids, health) lives elsewhere and
+/// is never written back here.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentSpec {
+    pub identity: Identity,
+    pub harness: Harness,
+    #[serde(default)]
+    pub agent: AgentConfig,
+    #[serde(default)]
+    pub resources: Resources,
+    #[serde(default)]
+    pub network: Network,
+    /// MCP servers this agent should hold. Credentials are broker KEYS, never
+    /// literal secrets — see [`Mcp::credential`].
+    #[serde(default, rename = "mcp")]
+    pub mcp: Vec<Mcp>,
+    /// Non-secret environment only. Validated against a deny-list.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Identity {
+    /// Agent's Nostr public key (64 lowercase hex). The secret key lives in the
+    /// broker under `nsec/<agent>` and never appears in a spec.
+    pub pubkey: String,
+    pub relay_url: String,
+    /// Plain owner pubkey. Sets `BUZZ_ACP_AGENT_OWNER`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pubkey: Option<String>,
+    /// NIP-OA owner attestation (`["auth", owner, conditions, sig]`). Sets
+    /// `BUZZ_AUTH_TAG`. Preferred over `owner_pubkey`: the agent then derives
+    /// relay access from its owner's membership (NIP-AA virtual membership)
+    /// rather than needing its own enrollment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Harness {
+    /// Catalog id (`claude`, `codex`, `goose`, …). Resolved to a command and an
+    /// image by the harness catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Escape hatch for a harness the catalog does not know: an explicit
+    /// command, which requires an explicit image that contains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Harness-specific model id. NOT portable between harnesses: Claude
+    /// advertises bare aliases (`opus`) and rejects `opus[1m]`, while Codex
+    /// advertises bracketed ids (`gpt-5.6-sol[high]`) where the suffix is
+    /// reasoning depth. Normalisation is therefore per-harness, in core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Who may trigger the agent: `owner-only` | `allowlist` | `anyone` | `nobody`.
+    /// Gates *triggering*, not *content* — thread history authored by anyone is
+    /// still pulled into the model's context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub respond_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub respond_to_allowlist: Vec<String>,
+    /// Maps to `BUZZ_ACP_IDLE_TIMEOUT`. Note: no `_SECONDS` suffix, and the
+    /// older `BUZZ_ACP_TURN_TIMEOUT` name is deprecated upstream — it warns at
+    /// startup and is easy to set for months without noticing it does nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turn_duration: Option<u64>,
+    /// Maps to `BUZZ_ACP_AGENTS` — the size of the in-process harness pool, so
+    /// one slot per concurrent *channel*, not per subagent. Container count
+    /// tracks agents × relays; this tracks conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<u32>,
+    /// Publish NIP-AO observer frames so the desktop can watch the agent work.
+    /// The harness defaults this OFF, which makes a remote agent function
+    /// perfectly while appearing to do nothing — a local agent is observed over
+    /// stdio, a container has no stdio to observe. Default on here.
+    #[serde(default = "default_true")]
+    pub observer: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// Hand-written rather than derived. `#[serde(default = "…")]` on a field only
+// applies when the containing table EXISTS and omits it; when the whole
+// `[agent]` section is absent serde calls `Default::default()`, and a derived
+// impl would give `observer: false` — producing exactly the silently-invisible
+// agent this field exists to prevent. Caught by a test, not by review.
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: None,
+            model: None,
+            respond_to: None,
+            respond_to_allowlist: Vec::new(),
+            idle_timeout: None,
+            max_turn_duration: None,
+            parallelism: None,
+            observer: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Resources {
+    pub memory: String,
+    pub cpus: f64,
+    pub pids: i64,
+}
+
+impl Default for Resources {
+    fn default() -> Self {
+        // Deliberately roomier than one harness needs: an agent may shell out
+        // to another harness (a Claude agent invoking codex), which puts a
+        // second model process under the same cap.
+        Self { memory: "3g".into(), cpus: 2.0, pids: 512 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkProfile {
+    /// Public internet on :443, the relay, and the broker socket. Nothing on
+    /// the local network, no other agent, no other host port.
+    #[default]
+    Standard,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Network {
+    #[serde(default)]
+    pub profile: NetworkProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Remote MCP over HTTP. Credentials ride headers, supplied per-connection
+    /// by the broker rather than written into the container.
+    Http,
+    /// Local MCP subprocess inside the container.
+    Stdio,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Mcp {
+    pub name: String,
+    pub transport: McpTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// A *broker key* (e.g. `mcp/parachute`), never a literal secret. The
+    /// broker resolves it at connection time; the value never lands in the
+    /// container's environment or filesystem, so `docker inspect` cannot
+    /// reveal it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+impl AgentSpec {
+    pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(s)
+    }
+
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+
+    /// Stable hash of the spec, stamped onto the container as a label so the
+    /// reconciler can tell "matches desired" from "needs replacing" without
+    /// diffing container config field by field.
+    pub fn hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        // Serialisation is deterministic: BTreeMap for env, Vec order preserved.
+        let canonical = self.to_toml().unwrap_or_default();
+        hex::encode(&Sha256::digest(canonical.as_bytes())[..16])
+    }
+
+    pub fn validate(&self) -> ValidationReport {
+        validate::validate(self)
+    }
+}

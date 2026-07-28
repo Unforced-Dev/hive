@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hive-spec",
+    "crates/hive-core",
+    "crates/hive-broker",
+    "crates/hived",
+    "crates/hive-cli",
+    "crates/buzz-backend-hive",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+repository = "https://github.com/Unforced-Dev/hive"
+authors = ["Unforced Dev"]
+
+[workspace.dependencies]
+# Dependency direction is strictly downward to hive-spec.
+# hive-core and hive-broker must NOT depend on each other: core defines a
+# CredentialSource trait, the daemon wires the broker in as its implementation.
+# That keeps secrets out of core's address space.
+hive-spec = { path = "crates/hive-spec" }
+hive-core = { path = "crates/hive-core" }
+hive-broker = { path = "crates/hive-broker" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "signal", "process", "time", "sync"] }
+clap = { version = "4", features = ["derive", "env"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+strip = true
+lto = "thin"
