@@ -165,7 +165,23 @@ fn deploy(req: &Value) -> Result<Value> {
         .get("relay_url")
         .and_then(Value::as_str)
         .context("agent.relay_url is required")?;
-    let pubkey = agent.get("pubkey").and_then(Value::as_str).unwrap_or("");
+    // Buzz's deploy payload does not carry the agent's pubkey — only its nsec —
+    // so derive it. Reading a `pubkey` field first keeps a hand-written or
+    // future payload that does supply one authoritative.
+    //
+    // Not optional: hived uses identity.pubkey to detect two specs deploying one
+    // identity to the same relay, which would answer every mention twice and
+    // charge the owner twice. Left empty, every provider-deployed agent collides
+    // with every other and all of them are held.
+    let derived;
+    let pubkey = match agent.get("pubkey").and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            derived = pubkey_from_nsec(nsec)
+                .context("deriving the agent's pubkey from its key")?;
+            &derived
+        }
+    };
     let owner = agent
         .get("owner_pubkey")
         .and_then(Value::as_str)
@@ -213,13 +229,20 @@ fn deploy(req: &Value) -> Result<Value> {
         .stdin_to(&["hive", "secret", "put", &identity_key], nsec)
         .context("storing the agent key in the hive broker")?;
 
-    // `cat > file` rather than scp: one connection, no temp file on either side,
-    // and it works when the remote has no scp. `docker exec -i` accepts the
-    // same shell, so one code path serves both transports.
+    // Through the CLI, not `sh -c 'cat > file'`.
+    //
+    // Writing the file directly assumes the spec directory is a path on the
+    // machine ssh lands on. Where hived runs in a container — which on macOS and
+    // Windows it must, because the broker's sockets cannot cross the Docker VM
+    // boundary — /etc/hive/agents is a VOLUME, and the shell redirect fails with
+    // "mkdir: /etc/hive: Permission denied" against a directory the host does
+    // not have. `hive spec put` resolves the directory wherever the daemon
+    // actually lives, and validates before installing, so a spec that would only
+    // be held never lands.
     let spec_path = format!("{spec_dir}/{name}.toml");
     target
-        .stdin_to(&["sh", "-c", &format!("mkdir -p {spec_dir} && cat > {spec_path}")], &spec)
-        .context("writing the agent spec")?;
+        .stdin_to(&["hive", "--spec-dir", &spec_dir, "spec-put", &name], &spec)
+        .context("installing the agent spec")?;
 
     warnings.push(format!(
         "spec written to {}:{spec_path}. hived will reconcile it on its next pass; \
@@ -645,5 +668,186 @@ mod tests {
         let parsed = hive_spec::AgentSpec::from_toml(&spec)
             .unwrap_or_else(|e| panic!("quoting broke the spec: {e}\n---\n{spec}"));
         assert!(parsed.agent.system_prompt.unwrap().contains('"'));
+    }
+}
+
+// ── nsec → pubkey ───────────────────────────────────────────────────────────
+//
+// Buzz's deploy payload carries `private_key_nsec` but NOT the agent's pubkey,
+// so the provider has to derive it. That is not cosmetic: hived uses
+// `identity.pubkey` to detect two specs deploying the same identity to the same
+// relay — which would answer every mention twice and charge the owner twice —
+// and an empty one makes every provider-deployed agent collide with every other.
+//
+// bech32 is decoded here rather than pulled in as a dependency: it is thirty
+// lines, and the checksum is the part that matters (a mistyped nsec must fail
+// loudly rather than derive a plausible wrong key).
+
+const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+fn bech32_polymod(values: &[u8]) -> u32 {
+    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    let mut chk: u32 = 1;
+    for v in values {
+        let b = chk >> 25;
+        chk = ((chk & 0x01ff_ffff) << 5) ^ u32::from(*v);
+        for (i, g) in GEN.iter().enumerate() {
+            if (b >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    chk
+}
+
+fn bech32_hrp_expand(hrp: &str) -> Vec<u8> {
+    let mut v: Vec<u8> = hrp.bytes().map(|c| c >> 5).collect();
+    v.push(0);
+    v.extend(hrp.bytes().map(|c| c & 31));
+    v
+}
+
+/// Decode a bech32 string, returning (hrp, 5-bit data without the checksum).
+fn bech32_decode(s: &str) -> Result<(String, Vec<u8>)> {
+    let s = s.trim();
+    if s.len() < 8 || s.len() > 200 {
+        bail!("not a bech32 string: implausible length");
+    }
+    // Mixed case is invalid per BIP-173 — the checksum is case-sensitive.
+    if s.chars().any(|c| c.is_ascii_uppercase()) && s.chars().any(|c| c.is_ascii_lowercase()) {
+        bail!("not a bech32 string: mixed case");
+    }
+    let lower = s.to_ascii_lowercase();
+    let sep = lower.rfind('1').context("not a bech32 string: no separator")?;
+    let (hrp, rest) = lower.split_at(sep);
+    if hrp.is_empty() {
+        bail!("not a bech32 string: empty prefix");
+    }
+    let mut data = Vec::with_capacity(rest.len() - 1);
+    for c in rest[1..].chars() {
+        let idx = BECH32_CHARSET
+            .find(c)
+            .with_context(|| format!("not a bech32 string: bad character {c:?}"))?;
+        data.push(idx as u8);
+    }
+    if data.len() < 6 {
+        bail!("not a bech32 string: truncated checksum");
+    }
+    let mut check_input = bech32_hrp_expand(hrp);
+    check_input.extend_from_slice(&data);
+    if bech32_polymod(&check_input) != 1 {
+        bail!("bech32 checksum failed — the key is mistyped or truncated");
+    }
+    data.truncate(data.len() - 6);
+    Ok((hrp.to_string(), data))
+}
+
+/// Regroup 5-bit values into 8-bit bytes, rejecting a malformed tail.
+fn from_base32(data: &[u8]) -> Result<Vec<u8>> {
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::new();
+    for v in data {
+        acc = (acc << 5) | u32::from(*v);
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    if bits >= 5 || (acc & ((1 << bits) - 1)) != 0 {
+        bail!("bech32 payload has a malformed tail");
+    }
+    Ok(out)
+}
+
+/// The agent's x-only public key, as 64 lowercase hex, from its `nsec`.
+///
+/// Accepts a bare 64-hex secret too: Buzz stores an `nsec`, but a spec written
+/// by hand may carry either, and refusing the hex form here would be a
+/// difference with no reason behind it.
+fn pubkey_from_nsec(nsec: &str) -> Result<String> {
+    let secret: Vec<u8> = if nsec.len() == 64 && nsec.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex::decode(nsec).context("decoding a hex secret key")?
+    } else {
+        let (hrp, data) = bech32_decode(nsec)?;
+        if hrp != "nsec" {
+            bail!("expected an nsec, got a {hrp:?} key");
+        }
+        from_base32(&data)?
+    };
+    if secret.len() != 32 {
+        bail!("a secret key is 32 bytes, got {}", secret.len());
+    }
+    let sk = secp256k1::SecretKey::from_byte_array(
+        secret.as_slice().try_into().expect("checked 32 bytes"),
+    )
+    .context("that is not a valid secp256k1 secret key")?;
+    let secp = secp256k1::Secp256k1::new();
+    let (xonly, _parity) = sk.x_only_public_key(&secp);
+    Ok(hex::encode(xonly.serialize()))
+}
+
+#[cfg(test)]
+mod nsec_tests {
+    use super::*;
+
+    // BIP-340 / NIP-19 vector: secret key of all 0x01 bytes.
+    const HEX_SK: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+    #[test]
+    fn a_hex_secret_and_its_nsec_derive_the_same_pubkey() {
+        let from_hex = pubkey_from_nsec(HEX_SK).expect("hex form");
+        assert_eq!(from_hex.len(), 64);
+        assert!(from_hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_mistyped_key_fails_the_checksum_rather_than_deriving_a_wrong_one() {
+        // The whole reason the checksum is verified: silently deriving a
+        // plausible pubkey from a corrupted nsec would deploy an agent whose
+        // identity nobody can explain.
+        let good = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
+        let mut bad: Vec<char> = good.chars().collect();
+        bad[10] = if bad[10] == 'q' { 'p' } else { 'q' };
+        let bad: String = bad.into_iter().collect();
+        assert!(pubkey_from_nsec(&bad).is_err(), "accepted a corrupted nsec");
+    }
+
+    #[test]
+    fn the_nip19_vector_decodes_to_its_documented_secret() {
+        // NIP-19's example nsec and the hex secret it documents. This pins the
+        // half written here — bech32 decode and the 5-to-8-bit regroup. The
+        // curve arithmetic is the secp256k1 crate's and is not re-asserted.
+        //
+        // An earlier version of this test claimed a pubkey for this nsec taken
+        // from NIP-19's *other* example. They are unrelated vectors, not a
+        // keypair, and the assertion was wrong.
+        let nsec = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
+        let (hrp, data) = bech32_decode(nsec).expect("valid bech32");
+        assert_eq!(hrp, "nsec");
+        assert_eq!(
+            hex::encode(from_base32(&data).expect("valid payload")),
+            "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"
+        );
+    }
+
+    #[test]
+    fn the_nsec_and_hex_forms_of_one_key_agree() {
+        // The two accepted input forms must not disagree; if they ever did, an
+        // agent would deploy under a different identity depending on which form
+        // the caller happened to have.
+        let nsec = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
+        let hex_sk = "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa";
+        assert_eq!(
+            pubkey_from_nsec(nsec).expect("nsec"),
+            pubkey_from_nsec(hex_sk).expect("hex")
+        );
+    }
+
+    #[test]
+    fn an_npub_is_refused_rather_than_treated_as_a_secret() {
+        let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        assert!(pubkey_from_nsec(npub).is_err());
     }
 }

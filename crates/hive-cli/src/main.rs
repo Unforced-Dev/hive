@@ -45,6 +45,23 @@ struct Cli {
 enum Command {
     /// Check a spec file without deploying it. Works offline.
     Validate { file: PathBuf },
+    /// Install an agent spec, read from stdin.
+    ///
+    /// The only way to get a spec to the daemon that does not assume the spec
+    /// directory is a path on the caller's filesystem. Where hived runs in a
+    /// container — which on macOS and Windows it must — `/etc/hive/agents` is a
+    /// volume, so `ssh host 'cat > /etc/hive/agents/x.toml'` fails with
+    /// "Permission denied" on a directory the host does not have. Routing
+    /// through the CLI means one code path serves a native daemon, a
+    /// containerized one, and a remote one over ssh.
+    ///
+    /// Validated before it lands: a spec that would be rejected never reaches
+    /// the directory, so hived is not asked to reconcile something it will only
+    /// hold and log about.
+    SpecPut {
+        /// Agent name. The spec is written as `<name>.toml`.
+        name: String,
+    },
     /// Which harnesses this build can run, and which it refuses.
     Harnesses,
     /// What the daemon currently believes.
@@ -184,6 +201,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
         Command::Validate { file } => validate(file),
+        Command::SpecPut { name } => spec_put(&cli.spec_dir, name),
         Command::Harnesses => harnesses(),
         Command::Status => status(&cli.control_socket),
         Command::Ps => ps(),
@@ -214,6 +232,62 @@ fn main() -> Result<()> {
             firewall(agent.as_deref(), host_addr, *published)
         }
     }
+}
+
+/// Install a spec read from stdin, after validating it.
+///
+/// Rejects a bad spec BEFORE it lands. hived holds an invalid spec and logs
+/// about it, which is correct but happens on the far side of an ssh call whose
+/// output nobody is reading — the deploy reports success and the agent never
+/// appears. Failing here puts the reason on the caller's stderr.
+fn spec_put(spec_dir: &std::path::Path, name: &str) -> Result<()> {
+    // The name becomes a filename in a directory hive owns. A traversal here
+    // would let a deploy write anywhere the daemon can reach.
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        bail!(
+            "invalid agent name {name:?}: use lowercase letters, digits, '-' and '_'. \
+             It becomes a filename and a container name."
+        );
+    }
+
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .context("reading the spec from stdin")?;
+    if text.trim().is_empty() {
+        bail!("no spec on stdin");
+    }
+
+    let spec = AgentSpec::from_toml(&text).context("parsing spec")?;
+    let report = spec.validate();
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    if !report.errors.is_empty() {
+        for e in &report.errors {
+            eprintln!("error:   {e}");
+        }
+        bail!("spec is not valid; nothing written");
+    }
+    agent::resolve_harness(&spec)?;
+
+    std::fs::create_dir_all(spec_dir)
+        .with_context(|| format!("creating {}", spec_dir.display()))?;
+    let path = spec_dir.join(format!("{name}.toml"));
+    // Write-then-rename: hived watches this directory, and a partially written
+    // file is a spec it will try to parse and reject.
+    let tmp = spec_dir.join(format!(".{name}.toml.tmp"));
+    std::fs::write(&tmp, text.as_bytes())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("installing {}", path.display()))?;
+
+    println!("wrote {} ({} bytes)", path.display(), text.len());
+    println!("hived will reconcile it on its next pass; `hive status` to watch.");
+    Ok(())
 }
 
 fn validate(file: &PathBuf) -> Result<()> {
