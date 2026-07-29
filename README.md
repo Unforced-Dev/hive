@@ -115,11 +115,20 @@ docker exec hived hive status
 inside the container breaks agent socket mounts in a way that only shows up
 inside the harness.
 
-Store credentials through the daemon so they never reach a shell history:
+### The CLI
+
+`hive` talks to the daemon over a control socket, which is inside the VM for the
+same reason the daemon is — so the CLI has to run on that side too. Install the
+wrapper rather than typing `docker exec` at every command; the container is an
+implementation detail and should not be part of the interface:
 
 ```console
-$ docker exec -i hived hive secret put nsec/scribe < agent.nsec
+$ install -m 0755 packaging/hive-wrapper.sh ~/.local/bin/hive
+$ hive status
+$ hive secret put nsec/scribe < agent.nsec
 ```
+
+Credentials go in over stdin, so they never reach shell history.
 
 Then point the Buzz desktop shim at the container rather than at an SSH host —
 set **hived container** to `hived` and leave **hive host** blank.
