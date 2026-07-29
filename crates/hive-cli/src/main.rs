@@ -19,6 +19,9 @@ use hive_core::harness::CATALOG;
 use hive_core::{agent, network};
 use hive_spec::AgentSpec;
 
+mod mcp;
+mod oauth;
+
 #[derive(Parser)]
 #[command(name = "hive", version, about = "Run persistent ACP agents in isolated containers")]
 struct Cli {
@@ -82,6 +85,13 @@ enum Command {
     /// Manage credentials.
     #[command(subcommand)]
     Secret(SecretCmd),
+    /// MCP servers on an agent, and the credentials they need.
+    ///
+    /// Buzz cannot configure an HTTP MCP server — its `McpServer` is stdio-only
+    /// and the provider deploy payload carries no MCP field at all — so this is
+    /// where they live.
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// Print the firewall rules for hive's whole subnet pool, without applying them.
     ///
     /// Run this ONCE at setup. Every agent's network is allocated from the pool,
@@ -100,6 +110,64 @@ enum Command {
         /// conntrack matching.
         #[arg(long)]
         published: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Show the MCP servers configured on an agent.
+    List {
+        #[arg(long)]
+        agent: String,
+    },
+    /// Attach an HTTP MCP server. Re-running with the same name updates it
+    /// rather than adding a second block the harness would resolve arbitrarily.
+    Add {
+        name: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        agent: String,
+        /// Broker key holding its credential. Defaults to `mcp/<name>`.
+        #[arg(long)]
+        credential: Option<String>,
+        /// Restrict the agent to these tools. Empty means all of them.
+        #[arg(long)]
+        tool: Vec<String>,
+    },
+    /// Detach an MCP server. Its stored credential is left alone.
+    Rm {
+        name: String,
+        #[arg(long)]
+        agent: String,
+    },
+    /// Walk the OAuth flow for an attached server and store the result.
+    ///
+    /// Prefer this over `secret put` with a hand-minted token: the credential is
+    /// scoped to what the resource advertises and comes with a refresh token, so
+    /// it does not lapse mid-conversation.
+    Login {
+        name: String,
+        #[arg(long)]
+        agent: String,
+        /// Comma- or space-separated. Defaults to every scope the resource
+        /// advertises — narrowing is deliberate, because a token that silently
+        /// lacks write fails at the first write tool call rather than here.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Print the URL without trying to launch a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Exchange a stored refresh token for a fresh access token.
+    ///
+    /// Rarely needed by hand — it exists so an expired credential can be
+    /// renewed without walking the browser flow again, and so the same code
+    /// path is exercised outside the broker.
+    Refresh {
+        name: String,
+        #[arg(long)]
+        agent: String,
     },
 }
 
@@ -126,6 +194,22 @@ fn main() -> Result<()> {
         Command::Restart { agent } => restart(agent),
         Command::Doctor => doctor(&cli),
         Command::Secret(c) => secret(&cli.secrets_dir, c),
+        Command::Mcp(c) => match c {
+            McpCmd::List { agent } => mcp::list(&cli.spec_dir, &agent),
+            McpCmd::Add { name, url, agent, credential, tool } => {
+                mcp::add(&cli.spec_dir, &agent, &name, &url, credential.as_deref(), &tool)
+            }
+            McpCmd::Rm { name, agent } => mcp::rm(&cli.spec_dir, &agent, &name),
+            McpCmd::Refresh { name, agent } => mcp::refresh(&cli.spec_dir, &cli.secrets_dir, &agent, &name),
+            McpCmd::Login { name, agent, scope, no_browser } => mcp::login(
+                &cli.spec_dir,
+                &cli.secrets_dir,
+                &agent,
+                &name,
+                scope.as_deref(),
+                !no_browser,
+            ),
+        },
         Command::Firewall { agent, host_addr, published } => {
             firewall(agent.as_deref(), host_addr, *published)
         }
