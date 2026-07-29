@@ -151,11 +151,61 @@ Not worth upstreaming: hive itself. An agent host wants to outlive any one surfa
 and the multi-relay case — one identity, several communities — is structurally
 something a Buzz-internal runtime cannot own.
 
+## On macOS, `hived` runs in a container — and it is not a workaround
+
+`hived` **cannot run as a native macOS process.** The broker creates one unix
+socket per agent and bind-mounts it into that agent's container. On macOS the
+containers live inside a Linux VM, and a socket created on the host side and
+shared in through virtiofs is *visible but not connectable* — `connect()`
+returns `ENOTSUP`.
+
+That failure mode is the dangerous kind. `hived` would start, reconcile, create
+containers and report healthy, while every broker-delivered credential failed —
+the one feature whose entire purpose is keeping secrets out of containers.
+
+Running the daemon **inside a container** fixes it with no code change, because
+the daemon is then on the same kernel as the agents and the sockets are ordinary
+Linux sockets. Two mounts carry it:
+
+```
+-v /var/run/docker.sock:/var/run/docker.sock   # drive Docker
+-v /run/hive:/run/hive                          # PATH-MATCHED, see below
+```
+
+The second must map to **the same path inside and out**. `docker run -v`
+resolves the source against the *daemon's* filesystem, so when `hived` asks for
+`/run/hive/agent.sock` to be mounted into an agent, Docker looks for that path
+on the host. Mount the socket directory anywhere else inside the daemon
+container and Docker finds nothing there — and silently creates an empty
+*directory*, so the agent sees a directory where its socket should be and the
+error surfaces inside the harness. `images/agent/build.sh` already depends on
+this for the integration tests.
+
+**Rejected: moving the broker to TCP.** It works mechanically — a container
+reaches the macOS host on `host.docker.internal`. But the broker identifies its
+caller *solely* by which socket the request arrived on, because every agent
+container runs as uid 1001 and peer credentials cannot distinguish them. Over
+TCP every agent can reach every port, so one agent could request another's
+credentials. That replaces a working identity mechanism with none.
+
+The same image runs on Linux, so this is a portable deployment mode rather than
+a macOS special case — though on Linux `packaging/hived.service` remains simpler
+and is still the recommendation.
+
+**Consequence for the desktop shim:** with `hived` local there is no host to ssh
+to, so `buzz-backend-hive` grew a `hived_container` config field and reaches the
+daemon with `docker exec -i`. It still only ever does two things — store a
+credential, write a spec — so the transport is the entire difference.
+
 ## Open
 
 - **Retire or keep the Hetzner box (`uni`).** Undecided as of the wipe. Keeping it
   costs money and keeps hive's *remote* path exercised; retiring it makes the
   provider path vestigial and local mode urgent.
-- **arm64 image.** Never built — `uni` is amd64, the Mac mini is arm64. All nine
-  harnesses were verified installable on arm64 during research. `smoke.sh` is the
-  gate.
+- **`/run/hive` is tmpfs inside a Docker VM** and does not survive a VM restart.
+  Whatever starts the daemon container must create it first, or the broker has
+  nowhere to put sockets. Not yet automated.
+- **`cargo fmt --check` and `cargo clippy -D warnings` both fail on `main`.** The
+  fmt diff is edition-2024 import ordering; clippy flags two things in
+  `hive-core`. Neither is caused by this work, and both should be fixed
+  separately so the diff is not buried in reformatting.

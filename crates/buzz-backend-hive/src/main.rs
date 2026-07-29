@@ -73,15 +73,24 @@ fn info() -> Value {
         // Types matter: coerceConfigValues() converts "integer"/"number" with
         // Number() and "boolean" with value === "true" before sending. Declaring
         // the wrong type delivers a string where a bool or int is expected.
+        // Neither transport field is REQUIRED: exactly one of them is, and the
+        // desktop's schema cannot express that. Requiring ssh_host would make
+        // the local case impossible to fill in; requiring neither means deploy()
+        // has to explain the choice, which it does.
         "config_schema": {
             "type": "object",
-            "required": ["ssh_host"],
             "properties": {
                 "ssh_host": {
                     "type": "string",
-                    "title": "hive host",
-                    "description": "user@host running hived. Uses your existing SSH key; no daemon is exposed to the network.",
-                    "default": "root@hive-host"
+                    "title": "hive host (remote)",
+                    "description": "user@host running hived. Uses your existing SSH key; no daemon is exposed to the network. Leave blank if hived runs on THIS machine.",
+                    "default": ""
+                },
+                "hived_container": {
+                    "type": "string",
+                    "title": "hived container (local)",
+                    "description": "Name of a local hived container to deploy into, instead of connecting over SSH. Required on macOS and Windows, where hived must run inside the Docker VM. Ignored when 'hive host' is set.",
+                    "default": ""
                 },
                 "spec_dir": {
                     "type": "string",
@@ -137,10 +146,11 @@ fn deploy(req: &Value) -> Result<Value> {
     let cfg = req.get("provider_config").cloned().unwrap_or_else(|| json!({}));
 
     let get = |k: &str| cfg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let ssh_host = {
-        let h = get("ssh_host");
-        if h.is_empty() { "root@hive-host".to_string() } else { h }
-    };
+    // ssh_host wins when both are set, because a filled-in remote host is an
+    // explicit statement about WHERE the agent should run, while
+    // hived_container may be left over from a local experiment. Silently
+    // deploying to the wrong machine is the expensive mistake here.
+    let target = Target::choose(&get("ssh_host"), &get("hived_container"))?;
     let spec_dir = {
         let d = get("spec_dir");
         if d.is_empty() { "/etc/hive/agents".to_string() } else { d }
@@ -195,21 +205,26 @@ fn deploy(req: &Value) -> Result<Value> {
     let harness = resolve_harness(cmd, &cmd_args, &get("harness"), &mut warnings);
     let spec = build_spec(&agent, &cfg, pubkey, relay_url, owner, &identity_key, &harness);
 
-    // The nsec goes to the broker over SSH stdin, never as an argument:
-    // arguments land in shell history and in `ps` output for every user on the
-    // box. It is not written into the spec, which is meant to be committable.
-    ssh_stdin(&ssh_host, &["hive", "secret", "put", &identity_key], nsec)
+    // The nsec goes over stdin, never as an argument: arguments land in shell
+    // history and in `ps` output for every user on the box — and for the local
+    // transport, in `docker inspect` too. It is not written into the spec,
+    // which is meant to be committable.
+    target
+        .stdin_to(&["hive", "secret", "put", &identity_key], nsec)
         .context("storing the agent key in the hive broker")?;
 
     // `cat > file` rather than scp: one connection, no temp file on either side,
-    // and it works when the remote has no scp.
-    let target = format!("{spec_dir}/{name}.toml");
-    ssh_stdin(&ssh_host, &["sh", "-c", &format!("mkdir -p {spec_dir} && cat > {target}")], &spec)
+    // and it works when the remote has no scp. `docker exec -i` accepts the
+    // same shell, so one code path serves both transports.
+    let spec_path = format!("{spec_dir}/{name}.toml");
+    target
+        .stdin_to(&["sh", "-c", &format!("mkdir -p {spec_dir} && cat > {spec_path}")], &spec)
         .context("writing the agent spec")?;
 
     warnings.push(format!(
-        "spec written to {ssh_host}:{target}. hived will reconcile it on its next pass; \
-         run `hive status` on the host to watch."
+        "spec written to {}:{spec_path}. hived will reconcile it on its next pass; \
+         run `hive status` there to watch.",
+        target.describe()
     ));
 
     Ok(json!({ "agent_id": name, "warnings": warnings }))
@@ -382,30 +397,85 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-/// Run a command on the hive host, feeding `input` to its stdin.
-fn ssh_stdin(host: &str, argv: &[&str], input: &str) -> Result<()> {
-    let ssh = find_ssh()?;
-    let mut child = Command::new(ssh)
-        // Fail rather than hang on an unknown host: this runs under a GUI with
-        // no terminal to answer a prompt on, so an interactive question is an
-        // indefinite hang with no visible cause.
-        .args(["-o", "BatchMode=yes", host])
-        .args(argv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning ssh")?;
-    child
-        .stdin
-        .take()
-        .context("ssh stdin")?
-        .write_all(input.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!("ssh {host}: {}", String::from_utf8_lossy(&out.stderr).trim());
+/// Where `hived` is, and therefore how to hand it a spec and a secret.
+///
+/// The shim only ever runs two commands — store a credential, write a file —
+/// so the transport is the entire difference between a remote and a local hive.
+// Debug so tests can use `unwrap_err()`. Both variants hold a destination, not
+// a credential, so there is nothing here that must not be printed.
+#[derive(Debug)]
+enum Target {
+    /// `hived` on another machine, reached with the user's existing SSH key.
+    Ssh(String),
+    /// `hived` in a container on THIS machine.
+    ///
+    /// This is not merely a convenience for single-box setups: on macOS and
+    /// Windows it is the only arrangement that works. `hived` bind-mounts a
+    /// per-agent unix socket into each agent container, and a socket created
+    /// on the host side of a Docker VM cannot be connected to from inside it
+    /// (`connect()` returns ENOTSUP). So `hived` must live in the VM, and the
+    /// shim reaches it through `docker exec` rather than over a network.
+    Container(String),
+}
+
+impl Target {
+    fn choose(ssh_host: &str, container: &str) -> Result<Self> {
+        match (ssh_host.trim(), container.trim()) {
+            ("", "") => bail!(
+                "set either 'hive host' (for a remote hived over SSH) or \
+                 'hived container' (for one running locally in Docker)"
+            ),
+            (h, _) if !h.is_empty() => Ok(Target::Ssh(h.to_string())),
+            (_, c) => Ok(Target::Container(c.to_string())),
+        }
     }
-    Ok(())
+
+    /// For messages shown to the user. Not a shell-safe value.
+    fn describe(&self) -> String {
+        match self {
+            Target::Ssh(h) => h.clone(),
+            Target::Container(c) => format!("container {c}"),
+        }
+    }
+
+    /// Run a command where `hived` lives, feeding `input` to its stdin.
+    fn stdin_to(&self, argv: &[&str], input: &str) -> Result<()> {
+        let (bin, lead): (String, Vec<String>) = match self {
+            Target::Ssh(host) => (
+                find_ssh()?,
+                // Fail rather than hang on an unknown host: this runs under a
+                // GUI with no terminal to answer a prompt on, so an
+                // interactive question is an indefinite hang with no visible
+                // cause.
+                vec!["-o".into(), "BatchMode=yes".into(), host.clone()],
+            ),
+            Target::Container(name) => (
+                find_docker()?,
+                // -i, not -it: there is no tty here, and `docker exec -t`
+                // without one fails outright.
+                vec!["exec".into(), "-i".into(), name.clone()],
+            ),
+        };
+
+        let mut child = Command::new(&bin)
+            .args(&lead)
+            .args(argv)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning {bin}"))?;
+        child
+            .stdin
+            .take()
+            .context("child stdin")?
+            .write_all(input.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!("{}: {}", self.describe(), String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
 }
 
 /// Locate ssh without trusting PATH.
@@ -422,6 +492,24 @@ fn find_ssh() -> Result<String> {
     Ok("ssh".to_string())
 }
 
+/// Locate the Docker CLI without trusting PATH, for the same reason as
+/// [`find_ssh`] — and more acutely, because Docker is never in the default
+/// launchd PATH on macOS. The candidate list mirrors
+/// `hive_core::docker::DockerBackend::discover`.
+fn find_docker() -> Result<String> {
+    for p in [
+        "/usr/local/bin/docker",
+        "/opt/homebrew/bin/docker",
+        "/usr/bin/docker",
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+    ] {
+        if std::path::Path::new(p).is_file() {
+            return Ok(p.to_string());
+        }
+    }
+    Ok("docker".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +521,50 @@ mod tests {
         let i = info();
         assert!(i["config_schema"]["properties"].is_object());
         assert_eq!(i["id"], "hive");
+    }
+
+    #[test]
+    fn an_unconfigured_transport_is_an_error_not_a_guessed_host() {
+        // This previously defaulted to `root@hive-host`, so a deploy with no
+        // configuration attempted SSH to a host that does not exist and failed
+        // with a name-resolution error — which reads as a network problem
+        // rather than as "you have not said where hive is".
+        let e = Target::choose("", "").unwrap_err().to_string();
+        assert!(e.contains("hive host"), "the error must name the fields to set: {e}");
+        assert!(e.contains("hived container"), "the error must offer the local option: {e}");
+    }
+
+    #[test]
+    fn a_local_deploy_needs_no_ssh_host() {
+        // The whole point of local mode: on macOS there is no host to ssh to,
+        // because hived runs in the Docker VM alongside the agents.
+        match Target::choose("", "hived").unwrap() {
+            Target::Container(c) => assert_eq!(c, "hived"),
+            Target::Ssh(h) => panic!("chose ssh to {h} with no host configured"),
+        }
+    }
+
+    #[test]
+    fn a_configured_ssh_host_is_not_overridden_by_a_leftover_container_name() {
+        // Both fields are free text in the desktop UI and neither is required,
+        // so a container name left over from a local experiment can easily sit
+        // beside a real remote host. Preferring the container would deploy the
+        // agent to the wrong machine and report success.
+        match Target::choose("root@box", "hived").unwrap() {
+            Target::Ssh(h) => assert_eq!(h, "root@box"),
+            Target::Container(c) => panic!("deployed to local container {c} despite a remote host"),
+        }
+    }
+
+    #[test]
+    fn whitespace_only_config_counts_as_unset() {
+        // A field the user cleared can come back as " " rather than "", and a
+        // space-only ssh host would otherwise be spawned as a real destination.
+        assert!(Target::choose("  ", "  ").is_err());
+        match Target::choose("  ", "hived").unwrap() {
+            Target::Container(c) => assert_eq!(c, "hived"),
+            Target::Ssh(h) => panic!("treated whitespace as a host: '{h}'"),
+        }
     }
 
     #[test]
