@@ -41,8 +41,37 @@ if [ "${1:-}" = "secret" ] && [ "${2:-}" = "put" ]; then
     needs_stdin=true
 fi
 
+# Locate docker without trusting PATH.
+#
+# A non-interactive `ssh host 'hive ...'` — which is exactly how
+# buzz-backend-hive deploys — gets PATH=/usr/bin:/bin:/usr/sbin:/sbin, with
+# neither Homebrew nor /usr/local/bin on it. Bare `docker` then fails with
+# "exec: docker: not found" from inside this wrapper, which reads as hive being
+# broken rather than as a login-shell difference. Same list as hive-acp's
+# find_docker and hive_core::docker::DockerBackend::discover.
+DOCKER="${HIVE_DOCKER:-}"
+if [ -z "$DOCKER" ]; then
+    for candidate in \
+        /usr/local/bin/docker \
+        /opt/homebrew/bin/docker \
+        /usr/bin/docker \
+        /Applications/Docker.app/Contents/Resources/bin/docker
+    do
+        if [ -x "$candidate" ]; then DOCKER="$candidate"; break; fi
+    done
+fi
+if [ -z "$DOCKER" ]; then
+    DOCKER=$(command -v docker 2>/dev/null) || true
+fi
+if [ -z "$DOCKER" ]; then
+    echo "hive: cannot find the docker CLI." >&2
+    echo "hive: looked in /usr/local/bin, /opt/homebrew/bin, /usr/bin and Docker.app." >&2
+    echo "hive: set HIVE_DOCKER=/path/to/docker if it lives somewhere else." >&2
+    exit 127
+fi
+
 if [ -t 0 ] && [ -t 1 ] && [ "$needs_stdin" = false ]; then
-    exec docker exec -i -t "$CONTAINER" hive "$@"
+    exec "$DOCKER" exec -i -t "$CONTAINER" hive "$@"
 else
-    exec docker exec -i "$CONTAINER" hive "$@"
+    exec "$DOCKER" exec -i "$CONTAINER" hive "$@"
 fi
