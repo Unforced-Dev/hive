@@ -165,6 +165,19 @@ pub struct Harness {
     /// container to log in.
     #[serde(default)]
     pub auth: HarnessAuth,
+
+    /// Which broker key holds this harness's credential. Defaults to
+    /// `harness/<id>`.
+    ///
+    /// One key per harness id means every agent on this box shares one
+    /// subscription, which is wrong in both directions: an agent running on
+    /// someone else's tokens has no way to say so, and a second subscription —
+    /// the obvious move when the first one runs out — cannot be expressed at
+    /// all. Naming the key here makes the credential a per-agent choice, and
+    /// swapping one is `hive secret put` against a different key rather than
+    /// overwriting the credential every other agent is using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

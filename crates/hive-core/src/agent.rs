@@ -89,8 +89,16 @@ pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, P
     if spec.harness.auth == hive_spec::HarnessAuth::Broker
         && let Some(var) = h.credential_env.first()
     {
+        // The spec may point at a different key: a second subscription, or
+        // someone else's tokens. Defaults to `harness/<id>` so the common case
+        // stays untyped.
+        let key = spec
+            .harness
+            .credential
+            .clone()
+            .unwrap_or_else(|| format!("harness/{}", h.id));
         reqs.push(Requirement {
-            key: CredentialKey::new(format!("harness/{}", h.id)),
+            key: CredentialKey::new(key),
             delivery: Delivery::Env { var: (*var).to_string() },
             purpose: "the model provider credential; without it the agent joins and cannot think",
         });
@@ -503,6 +511,44 @@ id = "claude"
             crate::backend::Names::volume("uni"),
             crate::backend::Names::volume("uni-other")
         );
+    }
+
+    #[test]
+    fn an_agent_can_name_its_own_harness_credential() {
+        // Two agents, two subscriptions. Without this every agent on the box
+        // shares one key, so a second subscription cannot be expressed and an
+        // agent running on someone else's tokens cannot say so — and swapping
+        // one means overwriting the credential every other agent is using.
+        let mut s = spec_toml("");
+        s.harness.id = Some("claude".into());
+
+        let default = requirements(&s, "a").unwrap();
+        assert!(default.iter().any(|r| r.key.as_str() == "harness/claude"));
+
+        s.harness.credential = Some("harness/claude-second".into());
+        let named = requirements(&s, "a").unwrap();
+        assert!(
+            named.iter().any(|r| r.key.as_str() == "harness/claude-second"),
+            "the spec's key was ignored"
+        );
+        assert!(
+            !named.iter().any(|r| r.key.as_str() == "harness/claude"),
+            "still demands the default key, so the agent needs both"
+        );
+    }
+
+    #[test]
+    fn a_named_credential_still_respects_non_broker_auth() {
+        // Naming a key must not resurrect the demand that `auth` just removed:
+        // an interactively logged-in harness holds its credential in the state
+        // volume, and hive never sees it whatever the key is called.
+        let mut s = spec_toml("");
+        s.harness.id = Some("claude".into());
+        s.harness.credential = Some("harness/claude-second".into());
+        s.harness.auth = hive_spec::HarnessAuth::Interactive;
+
+        let reqs = requirements(&s, "a").unwrap();
+        assert!(!reqs.iter().any(|r| r.key.as_str().starts_with("harness/")));
     }
 
     #[test]

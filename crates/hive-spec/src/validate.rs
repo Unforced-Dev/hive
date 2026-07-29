@@ -363,7 +363,7 @@ mod tests {
                 auth_tag: None,
                 credential: None,
             },
-            harness: Harness { id: Some("claude".into()), command: None, image: None, auth: HarnessAuth::Broker },
+            harness: Harness { id: Some("claude".into()), command: None, image: None, auth: HarnessAuth::Broker, credential: None },
             agent: AgentConfig { observer: true, ..Default::default() },
             resources: Resources::default(),
             network: Network::default(),
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn explicit_command_requires_explicit_image() {
         let mut s = base();
-        s.harness = Harness { id: None, command: Some("opencode acp".into()), image: None, auth: HarnessAuth::Broker };
+        s.harness = Harness { id: None, command: Some("opencode acp".into()), image: None, auth: HarnessAuth::Broker, credential: None };
         assert!(!s.validate().is_ok());
 
         s.harness.image = Some("hive/harness-opencode:1.4.2".into());
