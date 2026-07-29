@@ -115,16 +115,35 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/goose
 
 # --- grok (Grok Build) — first-party xAI ------------------------------------
-# GROK_HOME is the INSTALL location, not per-agent state. It must stay a shared
-# read-only path: point it into the per-agent volume and every agent
-# re-bootstraps its own 127 MB copy of the binary on first run.
+# GROK_HOME is BOTH the install location and the state directory, and grok needs
+# to WRITE to it: session storage, auth.json, settings. An earlier version of
+# this file pinned it read-only at /opt/grok to stop every agent re-bootstrapping
+# its own 127 MB copy of the binary — which worked, and made grok unusable:
+#
+#   session search bootstrap failed: unable to open database file:
+#     /opt/grok/sessions/session_search.sqlite
+#   No credentials found: no login token and no model api_key/env_key
+#   → session/new fails FS_PERMISSION_DENIED (os error 13)
+#
+# The credential half is the nastier one: with GROK_HOME set, grok reads
+# auth.json from there and NOT from ~/.grok, so a perfectly good login is
+# invisible and the error names a filesystem problem.
+#
+# So the install stays shared at /opt/grok and GROK_HOME points into the
+# per-agent volume, with the binary symlinked in by the entrypoint. Writable
+# state per agent, one 127 MB copy on disk.
 ARG GROK_VERSION=0.2.112
+# Set for the INSTALL only — the postinstall bootstraps the 127 MB binary into
+# whatever GROK_HOME points at, and unset it lands in root's home where the
+# agent user cannot reach it. Overridden to the per-agent path further down;
+# ENV is sequential, so the last one wins at runtime.
 ENV GROK_HOME=/opt/grok
 RUN npm install -g --no-fund --no-audit \
       --allow-scripts=@xai-official/grok \
       "@xai-official/grok@${GROK_VERSION}" \
  && npm cache clean --force \
- && chmod -R a+rX /opt/grok 2>/dev/null || true
+ && chmod -R a+rX /opt/grok 2>/dev/null || true \
+ && test -x /opt/grok/bin/grok
 
 # --- opencode ---------------------------------------------------------------
 ARG OPENCODE_VERSION=1.18.8
@@ -279,7 +298,9 @@ ENV XDG_DATA_HOME=/home/agent/state/data
 # entrypoint creates the targets, because on a FIRST run the volume is empty and
 # a dangling symlink makes the harness's own `mkdir -p` fail with EEXIST.
 ENV AMP_HOME=/home/agent/state/amp
-# GROK_HOME is deliberately NOT redirected here — see the install step.
+# GROK_HOME is per-agent: grok writes sessions there AND reads auth.json from
+# it. The entrypoint symlinks the shared 127 MB binary in.
+ENV GROK_HOME=/home/agent/state/grok
 
 # Create the state root AS THE AGENT USER, before VOLUME.
 #

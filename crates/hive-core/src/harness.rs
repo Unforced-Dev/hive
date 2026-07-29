@@ -175,12 +175,14 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["agent", "--always-approve", "stdio"],
         requires: &["grok"],
         credential_env: &["XAI_API_KEY"],
-        credential_file: None,
+        credential_file: Some("/home/agent/state/grok/auth.json"),
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
-        note: "First-party xAI. Starts and speaks JSON-RPC with no credentials present; auth is \
-               only needed for an actual turn. GROK_HOME must stay a shared read-only install \
-               path — pointed at per-agent state, every agent re-bootstraps 127 MB on first run.",
+        note: "First-party xAI. GROK_HOME is both install dir and state dir, and grok WRITES to it \
+               — sessions, settings, and auth.json, which it reads from there rather than from \
+               ~/.grok. Read-only, session/new fails FS_PERMISSION_DENIED while separately \
+               reporting no credentials. The image points it at per-agent state and symlinks the \
+               shared 127 MB binary in.",
     },
     HarnessDef {
         id: "opencode",

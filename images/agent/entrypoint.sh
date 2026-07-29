@@ -31,11 +31,33 @@ link_state() {
         ln -sfn "$target" "$HOME/$name"
     fi
 }
-link_state .grok      grok       # grok login -> ~/.grok/auth.json (GROK_HOME is the install dir, not this)
+link_state .grok      grok
 link_state .kimi      kimi
 link_state .cursor    cursor
 link_state .opencode  opencode
 link_state .omp       omp
+
+# grok wants ONE directory for both its install and its state: it writes
+# sessions and settings under $GROK_HOME, and reads auth.json from there rather
+# than from ~/.grok. Pointing it at the read-only install made session/new fail
+# `FS_PERMISSION_DENIED` while reporting no credentials — a filesystem error
+# standing in for two separate problems.
+#
+# So $GROK_HOME is per-agent and writable, with the 127 MB binary symlinked from
+# the shared install instead of copied. `grok` on PATH resolves through here, so
+# the version stays whatever the image installed.
+GROK_INSTALL=/opt/grok
+if [ -d "$GROK_INSTALL/bin" ]; then
+    mkdir -p "$STATE/grok/bin"
+    for f in "$GROK_INSTALL"/bin/*; do
+        [ -e "$f" ] || continue
+        ln -sfn "$f" "$STATE/grok/bin/$(basename "$f")"
+    done
+    # config.toml records how grok was installed; copied, not linked, because
+    # grok rewrites it and the install is read-only.
+    [ -f "$GROK_INSTALL/config.toml" ] && [ ! -f "$STATE/grok/config.toml" ] \
+        && cp "$GROK_INSTALL/config.toml" "$STATE/grok/config.toml"
+fi
 
 # A harness that is selected but absent fails inside buzz-acp as "agent failed
 # to spawn: No such file or directory", which surfaces on the desktop as "all N
