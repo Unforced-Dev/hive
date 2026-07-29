@@ -252,6 +252,8 @@ dependencies = [
  "hive-core",
  "hive-spec",
  "serde_json",
+ "sha2",
+ "toml_edit",
 ]
 
 [[package]]
