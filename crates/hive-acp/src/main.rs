@@ -4,12 +4,17 @@
 //!
 //! Buzz has two extension seams, and which one hive occupies decides a lot.
 //!
-//! As a **backend provider** ("where to run"), hive competes with Buzz's own
-//! notion of location — which is why the desktop shim had to reimplement remote
-//! deployment over ssh. As a **harness**, `harness=hive` composes with whatever
-//! Buzz already does about location: local, a remote provider, or this box
-//! acting as a provider for a laptop. Location stays Buzz's axis; the
-//! environment becomes hive's.
+//! A **backend provider** answers "where does this agent run": it receives the
+//! deploy payload — nsec, relay url, `agent_command`, `env_vars` — and starts
+//! `buzz-acp` somewhere. A **harness** answers "what does it run in". The old
+//! shim took the provider seam and therefore had to reimplement remote
+//! deployment over ssh, which is not a container-runtime problem.
+//!
+//! As a harness, `harness=hive` composes with whatever Buzz already does about
+//! location, because the deploy payload carries `agent_command` and `env_vars`
+//! verbatim: a provider that puts `buzz-acp` on another host will spawn
+//! `hive-acp` there with `HIVE_ENV` intact, and neither end needs to know about
+//! the other. Location stays Buzz's axis; the environment becomes hive's.
 //!
 //! So this is a Tier-3 custom harness (BYOH, buzz v0.5.0). `buzz-acp` spawns it
 //! exactly as it would spawn `claude-agent-acp`, and it speaks ACP on stdio.
@@ -485,7 +490,40 @@ mod tests {
     }
 }
 
-/// Resolve everything from the agent name plus its spec.
+/// Which hive environment to run in — `HIVE_ENV`, or the older `HIVE_AGENT`.
+///
+/// It selects a **container**: image, state volume, network, credentials, MCP
+/// servers. It says nothing about who the agent is. In `mode = "environment"`
+/// the container has no Nostr key at all — `buzz-acp` holds it on the host and
+/// Buzz strips it from the harness environment before spawning.
+///
+/// So `HIVE_AGENT` named the wrong thing. "Agent" is what Buzz calls the entity
+/// with the identity, and several Buzz agents pointing at one `HIVE_AGENT` were
+/// silently one container sharing skills, sessions and credentials — a bug the
+/// name actively hid. `HIVE_ENV` says what it selects.
+///
+/// The old name still works, with a warning rather than a break: it is written
+/// into harness definitions that already exist, and a rename that takes an
+/// agent offline mid-conversation to make a point is not an improvement.
+fn env_name() -> Result<String> {
+    let read = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    if let Some(v) = read("HIVE_ENV") {
+        return Ok(v);
+    }
+    if let Some(v) = read("HIVE_AGENT") {
+        eprintln!(
+            "hive-acp: HIVE_AGENT is deprecated, use HIVE_ENV. It selects a container, not an \
+             identity — and two Buzz agents sharing one value share one container."
+        );
+        return Ok(v);
+    }
+    bail!(
+        "HIVE_ENV is not set. hive-acp runs a harness inside one hive environment; set it \
+         per-agent in Buzz's agent environment variables, so each agent gets its own container."
+    )
+}
+
+/// Resolve everything from the environment name plus its spec.
 ///
 /// The harness is read from the spec rather than from an environment variable
 /// because the spec is what hived reconciled the container from. Taking it from
@@ -493,10 +531,7 @@ mod tests {
 /// harness that starts, answers `initialize`, and has none of the credentials
 /// the container was built for.
 fn resolve() -> Result<Config> {
-    let agent = std::env::var("HIVE_AGENT").ok().filter(|s| !s.is_empty()).context(
-        "HIVE_AGENT is not set. hive-acp runs one specific agent's harness; set it in the \
-         harness definition's env, or per-agent in Buzz's agent environment variables.",
-    )?;
+    let agent = env_name()?;
 
     let spec_dir =
         std::env::var("HIVE_SPEC_DIR").unwrap_or_else(|_| "/etc/hive/agents".to_string());
@@ -689,7 +724,7 @@ fn main() -> Result<()> {
     };
 
     eprintln!(
-        "hive-acp: agent={} container={} harness={}",
+        "hive-acp: env={} container={} harness={}",
         cfg.agent,
         cfg.container,
         cfg.argv.join(" ")
