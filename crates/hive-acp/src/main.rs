@@ -98,6 +98,11 @@ struct Config {
     credential_file: Option<String>,
     /// The spec's own harness id, when `HIVE_HARNESS` overrode it.
     overridden: Option<String>,
+    /// The parsed spec, kept so a hold can be explained before waiting on a
+    /// container that is never going to appear.
+    spec: AgentSpec,
+    /// Where hived lives, for the same reason.
+    daemon: String,
 }
 
 #[derive(Clone)]
@@ -490,6 +495,120 @@ mod tests {
     }
 }
 
+/// Name the credentials this spec needs that the broker does not hold.
+///
+/// hived HOLDS an agent whose credentials are missing rather than starting one
+/// that cannot work — correct, and invisible: the reason goes to the daemon's
+/// log, while the caller sits waiting for a container that is never coming and
+/// eventually reports a timeout. This turns that into a sentence naming the key.
+fn missing_credentials(daemon: &str, spec: &AgentSpec, agent: &str) -> Vec<String> {
+    let Ok(reqs) = hive_core::agent::requirements(spec, agent) else {
+        return Vec::new();
+    };
+    let out = Command::new(find_docker())
+        .args(["exec", daemon, "hive", "secret", "list"])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let held: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    reqs.iter()
+        .map(|r| r.key.as_str().to_string())
+        .filter(|k| !held.iter().any(|h| h == k))
+        .collect()
+}
+
+/// Block until the container is running, or give up and let the exec fail.
+///
+/// Returns rather than erroring on timeout: the `docker exec` that follows
+/// produces a better message than anything this function could invent, and a
+/// container that is merely slow should not be reported as absent.
+fn wait_for_container(container: &str) {
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(90);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let mut announced = false;
+    loop {
+        let running = Command::new(find_docker())
+            .args(["inspect", "--format", "{{.State.Running}}", container])
+            .output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false);
+        if running || std::time::Instant::now() >= deadline {
+            if announced && running {
+                eprintln!("hive-acp: {container} is up");
+            }
+            return;
+        }
+        if !announced {
+            eprintln!("hive-acp: waiting for {container} — hived reconciles on a timer");
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Create an environment that does not exist yet, through the daemon.
+///
+/// Deliberately minimal. An environment is a container to run a harness in:
+/// identity belongs to whatever spawned this process, credentials are named
+/// rather than stored in a spec, and MCP servers are added afterwards with
+/// `hive mcp add`. So the generated file says only which harness and which
+/// mode, and everything else is a considered addition rather than a default
+/// somebody has to discover and undo.
+///
+/// `HIVE_HARNESS` picks the harness when set, so the Buzz entry that named a
+/// harness also gets one configured for it.
+fn create_environment(daemon: &str, name: &str) -> Result<()> {
+    let harness = std::env::var("HIVE_HARNESS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "claude".to_string());
+
+    let spec = format!(
+        "# Created by hive-acp for Buzz agent {name:?}.\n\
+         # An environment: a container to run a harness in. The identity lives\n\
+         # with buzz-acp outside it, which is why there is no [identity] block.\n\
+         #\n\
+         # Add MCP servers with `hive mcp add <name> --url <url> --agent {name}`.\n\
+         \n\
+         [harness]\n\
+         id = {harness:?}\n\
+         \n\
+         [agent]\n\
+         mode = \"environment\"\n"
+    );
+
+    eprintln!("hive-acp: {name:?} has no environment yet; creating one (harness {harness})");
+    let mut child = Command::new(find_docker())
+        .args(["exec", "-i", daemon, "hive", "spec-put", name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("creating an environment for {name} via {daemon}"))?;
+    child
+        .stdin
+        .take()
+        .context("child stdin")?
+        .write_all(spec.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "could not create an environment for {name}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // hived reconciles on a timer, so the container does not exist yet. The
+    // caller only needs the SPEC to read a harness and MCP list out of; the
+    // container is waited for where it is actually used.
+    Ok(())
+}
+
 /// Which hive environment to run in — `HIVE_ENV`, or the older `HIVE_AGENT`.
 ///
 /// It selects a **container**: image, state volume, network, credentials, MCP
@@ -557,14 +676,36 @@ fn resolve() -> Result<Config> {
                 .output()
                 .with_context(|| format!("reading {} via {daemon}", path.display()))?;
             if !out.status.success() {
-                bail!(
-                    "cannot read {}: locally {local_err}; via container {daemon}: {}. \
-                     Has this agent been deployed? `hive status`",
-                    path.display(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
+                // No spec: create one rather than making the operator author a
+                // file before an agent can exist.
+                //
+                // An environment is nearly contentless — a harness id and a
+                // mode — because identity belongs to whatever spawned this and
+                // credentials are named, not stored, here. So there is nothing
+                // to invent and nothing to get wrong, which is what makes
+                // generating it safe rather than magic. Without this, every new
+                // Buzz agent needs a hand-written TOML on the host first, and
+                // the pressure is to point them all at one existing spec — which
+                // silently puts them in ONE container, sharing sessions, skills
+                // and credentials.
+                create_environment(&daemon, &agent)?;
+                let retry = Command::new(find_docker())
+                    .args(["exec", &daemon, "cat"])
+                    .arg(&path)
+                    .output()
+                    .with_context(|| format!("reading {} via {daemon}", path.display()))?;
+                if !retry.status.success() {
+                    bail!(
+                        "cannot read {}: locally {local_err}; via container {daemon}: {}. \
+                         Is hived running? `hive status`",
+                        path.display(),
+                        String::from_utf8_lossy(&retry.stderr).trim()
+                    );
+                }
+                String::from_utf8(retry.stdout).context("spec was not valid UTF-8")?
+            } else {
+                String::from_utf8(out.stdout).context("spec was not valid UTF-8")?
             }
-            String::from_utf8(out.stdout).context("spec was not valid UTF-8")?
         }
     };
     let spec: AgentSpec =
@@ -641,6 +782,8 @@ fn resolve() -> Result<Config> {
 
     Ok(Config {
         container: std::env::var("HIVE_CONTAINER").unwrap_or_else(|_| format!("hive-{agent}")),
+        daemon: std::env::var("HIVE_DAEMON_CONTAINER").unwrap_or_else(|_| "hived".to_string()),
+        spec,
         agent,
         argv,
         mcp,
@@ -745,6 +888,25 @@ fn main() -> Result<()> {
     }
     cmd.arg(&cfg.container);
     cmd.args(&cfg.argv);
+
+    // A freshly created environment has a spec but not yet a container: hived
+    // reconciles on a timer. Without this the first session after creating an
+    // agent fails with "no such container" and the second one works, which
+    // reads as flakiness rather than as a wait.
+    // Say why before waiting, not after. hived holds an agent whose credentials
+    // are missing, so the container never appears and the wait always burns its
+    // full patience before failing with a timeout that names nothing.
+    let missing = missing_credentials(&cfg.daemon, &cfg.spec, &cfg.agent);
+    if !missing.is_empty() {
+        eprintln!(
+            "hive-acp: {} is held — the broker has no {}. Store it with `hive secret put {}`, \
+             or give this environment a file credential if that is how the harness authenticates.",
+            cfg.agent,
+            missing.join(" or "),
+            missing.first().map(String::as_str).unwrap_or("<key>"),
+        );
+    }
+    wait_for_container(&cfg.container);
 
     let mut child = cmd
         .stdin(Stdio::piped())

@@ -67,12 +67,14 @@ pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, P
     // it holds the identity. Demanding an nsec here would hold the agent
     // forever waiting for a key that by design lives somewhere else, and the
     // hold reads as a missing credential rather than as a mode mismatch.
-    if spec.agent.mode.unwrap_or_default() == hive_spec::AgentMode::Relay {
+    if spec.agent.mode.unwrap_or_default() == hive_spec::AgentMode::Relay
+        && let Some(identity) = &spec.identity
+    {
         reqs.push(Requirement {
             // Not derived from the agent name: several specs may share one
             // identity across relays, and the secret key must live in exactly
             // one place.
-            key: CredentialKey::new(spec.identity.credential_key(agent)),
+            key: CredentialKey::new(identity.credential_key(agent)),
             // Necessarily an env var: buzz-acp reads BUZZ_PRIVATE_KEY at
             // startup and there is no file or helper form.
             delivery: Delivery::Env { var: "BUZZ_PRIVATE_KEY".into() },
@@ -150,22 +152,27 @@ pub fn mcp_token_env(server: &str) -> String {
 pub fn environment(spec: &AgentSpec, h: &HarnessDef, agent: &str) -> Result<BTreeMap<String, String>, PlanError> {
     let mut env = BTreeMap::new();
 
-    env.insert("BUZZ_RELAY_URL".into(), spec.identity.relay_url.clone());
+    // An environment has no identity: buzz-acp runs outside the container and
+    // holds it. Setting a relay url or an owner here would be describing a
+    // connection this container never makes.
+    if let Some(identity) = &spec.identity {
+        env.insert("BUZZ_RELAY_URL".into(), identity.relay_url.clone());
 
-    // Owner attestation. NIP-OA is preferred: the agent then derives relay
-    // access from its owner's membership (NIP-AA virtual membership) instead of
-    // needing its own enrollment.
-    match (&spec.identity.auth_tag, &spec.identity.owner_pubkey) {
-        (Some(tag), _) => {
-            env.insert("BUZZ_AUTH_TAG".into(), tag.clone());
+        // Owner attestation. NIP-OA is preferred: the agent then derives relay
+        // access from its owner's membership (NIP-AA virtual membership) instead
+        // of needing its own enrollment.
+        match (&identity.auth_tag, &identity.owner_pubkey) {
+            (Some(tag), _) => {
+                env.insert("BUZZ_AUTH_TAG".into(), tag.clone());
+            }
+            (None, Some(owner)) => {
+                env.insert("BUZZ_ACP_AGENT_OWNER".into(), owner.clone());
+            }
+            // Without either, the harness starts, connects, and responds to
+            // nobody. It looks completely healthy. Validation rejects this too;
+            // this is the second gate, because the cost of missing it is hours.
+            (None, None) => return Err(PlanError::NoOwner(agent.to_string())),
         }
-        (None, Some(owner)) => {
-            env.insert("BUZZ_ACP_AGENT_OWNER".into(), owner.clone());
-        }
-        // Without either, the harness starts, connects, and responds to nobody.
-        // It looks completely healthy. Validation rejects this too; this is the
-        // second gate, because the cost of missing it is hours.
-        (None, None) => return Err(PlanError::NoOwner(agent.to_string())),
     }
 
     env.insert("BUZZ_ACP_AGENT_COMMAND".into(), h.command.to_string());
@@ -451,7 +458,7 @@ id = "claude"
         // NIP-OA lets the agent derive relay access from its owner's membership
         // rather than needing its own enrollment.
         let mut s = spec_toml("");
-        s.identity.auth_tag = Some("[\"auth\",\"owner\",\"cond\",\"sig\"]".into());
+        s.identity.as_mut().unwrap().auth_tag = Some("[\"auth\",\"owner\",\"cond\",\"sig\"]".into());
         let h = resolve_harness(&s).unwrap();
         let env = environment(&s, h, "alice").unwrap();
         assert!(env.contains_key("BUZZ_AUTH_TAG"));
@@ -461,8 +468,8 @@ id = "claude"
     #[test]
     fn an_agent_with_no_owner_is_refused_rather_than_silently_idle() {
         let mut s = spec_toml("");
-        s.identity.owner_pubkey = None;
-        s.identity.auth_tag = None;
+        s.identity.as_mut().unwrap().owner_pubkey = None;
+        s.identity.as_mut().unwrap().auth_tag = None;
         let h = harness::lookup("claude").unwrap();
         assert!(matches!(environment(&s, h, "alice"), Err(PlanError::NoOwner(_))));
     }
@@ -492,8 +499,8 @@ id = "claude"
         // up stored twice, where one copy goes stale on rotation.
         let mut home = spec_toml("");
         let mut other = spec_toml("");
-        other.identity.relay_url = "wss://other.example".into();
-        other.identity.credential = Some("nsec/uni".into());
+        other.identity.as_mut().unwrap().relay_url = "wss://other.example".into();
+        other.identity.as_mut().unwrap().credential = Some("nsec/uni".into());
 
         // Different agent names, because they are different containers.
         let a = requirements(&home, "uni").unwrap();
@@ -506,7 +513,7 @@ id = "claude"
         assert_eq!(key_of(&b), "nsec/uni", "the second relay must reuse the same key");
 
         // ...and they are still separate containers with separate state.
-        home.identity.relay_url = "wss://home.example".into();
+        home.identity.as_mut().unwrap().relay_url = "wss://home.example".into();
         assert_ne!(
             crate::backend::Names::volume("uni"),
             crate::backend::Names::volume("uni-other")

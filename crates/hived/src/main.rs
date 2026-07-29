@@ -381,7 +381,11 @@ fn load_specs(dir: &Path) -> Result<BTreeMap<String, AgentSpec>> {
 fn duplicate_identities(specs: &BTreeMap<String, AgentSpec>) -> HashMap<String, String> {
     let mut seen: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
     for (name, spec) in specs {
-        seen.entry((&spec.identity.pubkey, &spec.identity.relay_url))
+        // Environments have no identity and therefore cannot collide. Treating
+        // a missing one as a shared empty key would make every environment spec
+        // a duplicate of every other and hold all of them.
+        let Some(identity) = &spec.identity else { continue };
+        seen.entry((identity.pubkey.as_str(), identity.relay_url.as_str()))
             .or_default()
             .push(name);
     }

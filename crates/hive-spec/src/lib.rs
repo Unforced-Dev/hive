@@ -20,7 +20,18 @@ pub use validate::{ValidationError, ValidationReport};
 /// is never written back here.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentSpec {
-    pub identity: Identity,
+    /// Who the agent is on the relay. Required in `mode = "relay"`, where hive
+    /// runs buzz-acp itself; absent in `mode = "environment"`, where the
+    /// container is a place to run a harness and the identity belongs to
+    /// whatever spawned it.
+    ///
+    /// Optional because an environment genuinely has none — buzz-acp holds the
+    /// key on the host and Buzz strips it from the harness environment before
+    /// spawning, so a pubkey in the spec would be a value nothing reads. Making
+    /// it mandatory meant every generated spec carried four lines of fiction
+    /// that read as configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
     pub harness: Harness,
     #[serde(default)]
     pub agent: AgentConfig,

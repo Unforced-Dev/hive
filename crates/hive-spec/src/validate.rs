@@ -75,56 +75,75 @@ pub fn validate(spec: &AgentSpec) -> ValidationReport {
     let mut r = ValidationReport::default();
 
     // ---- identity ----
-    if !is_hex64(&spec.identity.pubkey) {
-        r.errors.push(ValidationError::new(
-            "identity.pubkey",
-            "must be 64 lowercase hex characters",
-        ));
-    }
-    if !spec.identity.relay_url.starts_with("ws://")
-        && !spec.identity.relay_url.starts_with("wss://")
-    {
-        r.errors.push(ValidationError::new(
-            "identity.relay_url",
-            "must be a ws:// or wss:// URL",
-        ));
-    }
-
-    // Without an owner the harness drops every event and sits idle — no error,
-    // no log line, just an agent that never answers. Catch it here rather than
-    // letting someone debug a silent agent.
-    if spec.identity.owner_pubkey.is_none() && spec.identity.auth_tag.is_none() {
-        r.errors.push(ValidationError::new(
+    //
+    // Required only where hive runs buzz-acp itself. An environment container
+    // has no identity by design — the process holding the key runs outside it —
+    // and demanding one there produced specs carrying a pubkey nothing reads.
+    let is_relay = spec.agent.mode.unwrap_or_default() == crate::AgentMode::Relay;
+    match (&spec.identity, is_relay) {
+        (None, true) => r.errors.push(ValidationError::new(
             "identity",
-            "one of owner_pubkey or auth_tag is required — without either, \
-             the harness silently drops every event and the agent never responds",
-        ));
-    }
-    if let Some(owner) = &spec.identity.owner_pubkey
-        && !is_hex64(owner)
-    {
-        r.errors.push(ValidationError::new(
-            "identity.owner_pubkey",
-            "must be 64 lowercase hex characters",
-        ));
-    }
-    if spec.identity.owner_pubkey.is_some() && spec.identity.auth_tag.is_none() {
-        r.warnings.push(
-            "identity: using owner_pubkey without auth_tag — the agent needs its own \
-             relay membership. A NIP-OA auth_tag would let it derive access from its \
-             owner's membership instead, so revoking the human revokes the agent."
+            "required for mode = \"relay\": this container runs buzz-acp itself, \
+             which cannot join a relay without a key, a url and an owner",
+        )),
+        (Some(_), false) => r.warnings.push(
+            "identity is set but mode = \"environment\": nothing reads it. buzz-acp \
+             runs outside this container and holds the identity itself."
                 .into(),
-        );
+        ),
+        _ => {}
     }
 
-    if let Some(c) = &spec.identity.credential
-        && looks_like_a_secret(c)
-    {
-        r.errors.push(ValidationError::new(
-            "identity.credential",
-            "this is a broker KEY, not the private key itself — store the value with \
-             `hive secret put` and name it here",
-        ));
+    if let Some(identity) = &spec.identity {
+        if !is_hex64(&identity.pubkey) {
+            r.errors.push(ValidationError::new(
+                "identity.pubkey",
+                "must be 64 lowercase hex characters",
+            ));
+        }
+        if !identity.relay_url.starts_with("ws://") && !identity.relay_url.starts_with("wss://") {
+            r.errors.push(ValidationError::new(
+                "identity.relay_url",
+                "must be a ws:// or wss:// URL",
+            ));
+        }
+
+        // Without an owner the harness drops every event and sits idle — no
+        // error, no log line, just an agent that never answers. Catch it here
+        // rather than letting someone debug a silent agent.
+        if identity.owner_pubkey.is_none() && identity.auth_tag.is_none() {
+            r.errors.push(ValidationError::new(
+                "identity",
+                "one of owner_pubkey or auth_tag is required — without either, \
+                 the harness silently drops every event and the agent never responds",
+            ));
+        }
+        if let Some(owner) = &identity.owner_pubkey
+            && !is_hex64(owner)
+        {
+            r.errors.push(ValidationError::new(
+                "identity.owner_pubkey",
+                "must be 64 lowercase hex characters",
+            ));
+        }
+        if identity.owner_pubkey.is_some() && identity.auth_tag.is_none() {
+            r.warnings.push(
+                "identity: using owner_pubkey without auth_tag — the agent needs its own \
+                 relay membership. A NIP-OA auth_tag would let it derive access from its \
+                 owner's membership instead, so revoking the human revokes the agent."
+                    .into(),
+            );
+        }
+
+        if let Some(c) = &identity.credential
+            && looks_like_a_secret(c)
+        {
+            r.errors.push(ValidationError::new(
+                "identity.credential",
+                "this is a broker KEY, not the private key itself — store the value with \
+                 `hive secret put` and name it here",
+            ));
+        }
     }
 
     // ---- harness ----
@@ -375,13 +394,13 @@ pub(crate) mod tests {
 
     pub(crate) fn base() -> AgentSpec {
         AgentSpec {
-            identity: Identity {
+            identity: Some(Identity {
                 pubkey: PK.into(),
                 relay_url: "wss://buzz.example.org".into(),
                 owner_pubkey: Some(PK.into()),
                 auth_tag: None,
                 credential: None,
-            },
+            }),
             harness: Harness { id: Some("claude".into()), command: None, image: None, auth: HarnessAuth::Broker, credential: None },
             agent: AgentConfig { observer: true, ..Default::default() },
             resources: Resources::default(),
@@ -404,8 +423,8 @@ pub(crate) mod tests {
     #[test]
     fn missing_owner_is_an_error_not_a_silent_idle_agent() {
         let mut s = base();
-        s.identity.owner_pubkey = None;
-        s.identity.auth_tag = None;
+        s.identity.as_mut().unwrap().owner_pubkey = None;
+        s.identity.as_mut().unwrap().auth_tag = None;
         let r = s.validate();
         assert!(!r.is_ok());
         assert!(r.errors.iter().any(|e| e.to_string().contains("owner_pubkey or auth_tag")));
