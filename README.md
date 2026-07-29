@@ -81,6 +81,49 @@ sudo cp packaging/hived.service /etc/systemd/system/ && sudo systemctl enable --
 
 `hive doctor` checks the things that are usually wrong.
 
+## Install on macOS
+
+On macOS the daemon runs **in a container**, because it has to. `hived`
+bind-mounts a per-agent unix socket into each agent container, and a socket
+created on the macOS side of Docker's Linux VM cannot be connected to from
+inside it. A native `hived` would look healthy while every broker-delivered
+credential failed. [DECISIONS](docs/DECISIONS.md) has the detail.
+
+Works with any Docker on macOS. [Colima](https://github.com/abiosoft/colima) is
+a good fit for an always-on box since it needs no GUI session:
+
+```console
+brew install colima docker
+colima start --vm-type vz --vz-rosetta --mount-type virtiofs --cpu 8 --memory 8
+
+# The socket directory lives in the VM. /run is tmpfs, so this does not survive
+# a VM restart — recreate it whenever Colima restarts.
+colima ssh -- sudo mkdir -p /run/hive && colima ssh -- sudo chmod 755 /run/hive
+
+docker build -f images/hived/Dockerfile -t hive-daemon:latest .
+docker run -d --name hived --restart unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /run/hive:/run/hive \
+  -v hive-agents:/etc/hive/agents \
+  -v hive-secrets:/var/lib/hive \
+  hive-daemon:latest
+
+docker exec hived hive status
+```
+
+`-v /run/hive:/run/hive` is path-matched deliberately; mounting it anywhere else
+inside the container breaks agent socket mounts in a way that only shows up
+inside the harness.
+
+Store credentials through the daemon so they never reach a shell history:
+
+```console
+$ docker exec -i hived hive secret put nsec/scribe < agent.nsec
+```
+
+Then point the Buzz desktop shim at the container rather than at an SSH host —
+set **hived container** to `hived` and leave **hive host** blank.
+
 **Docs:** [ARCHITECTURE](docs/ARCHITECTURE.md) — what it is and how it works ·
 [DECISIONS](docs/DECISIONS.md) — why, and what was rejected ·
 [TESTING](docs/TESTING.md) — a hands-on walkthrough against a real relay
