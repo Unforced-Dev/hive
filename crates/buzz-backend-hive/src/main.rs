@@ -37,9 +37,14 @@ fn main() {
     // Every failure path must still emit valid JSON on stdout: the desktop
     // parses whatever it gets, and a bare panic message surfaces as an
     // unexplained provider error.
+    // `{:#}` and not `to_string()`: the latter prints only the OUTERMOST
+    // context, so every remote failure surfaced as a bare "installing the agent
+    // spec" while the reason — a validation error, a missing binary, an ssh
+    // refusal — sat one level down in the chain, discarded. The desktop shows
+    // this string verbatim and there is nowhere else to look.
     let response = match run() {
         Ok(v) => v,
-        Err(e) => json!({ "error": e.to_string() }),
+        Err(e) => json!({ "error": format!("{e:#}") }),
     };
     println!("{response}");
 }

@@ -167,6 +167,25 @@ pub fn validate(spec: &AgentSpec) -> ValidationReport {
             );
         }
     }
+
+    // buzz-acp refuses to start unless idle_timeout < max_turn_duration: the
+    // wall-clock cap would otherwise fire first and make idle_timeout a dead
+    // letter. Checked here as well because the container is where that refusal
+    // happens — `hive validate` said the spec was fine, hived reconciled it, and
+    // the agent crash-looped with the reason visible only in `docker logs`.
+    // Found by deploying one.
+    if let (Some(idle), Some(max)) = (spec.agent.idle_timeout, spec.agent.max_turn_duration)
+        && idle >= max
+    {
+        r.errors.push(ValidationError::new(
+            "agent.idle_timeout",
+            format!(
+                "must be less than max_turn_duration ({max}s), got {idle}s — the harness \
+                 refuses to start, because the wall-clock cap would fire before the idle \
+                 timeout ever could"
+            ),
+        ));
+    }
     if let Some(p) = spec.agent.parallelism
         && p == 0
     {
@@ -347,14 +366,14 @@ fn parse_memory_gb(s: &str) -> Option<f64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::*;
     use std::collections::BTreeMap;
 
     const PK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn base() -> AgentSpec {
+    pub(crate) fn base() -> AgentSpec {
         AgentSpec {
             identity: Identity {
                 pubkey: PK.into(),
@@ -600,5 +619,45 @@ mod tests {
         let text = s.to_toml().expect("serialises");
         let back = AgentSpec::from_toml(&text).expect("parses");
         assert_eq!(s, back);
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    fn has_idle_error(s: &AgentSpec) -> bool {
+        s.validate().errors.iter().any(|e| {
+            let ValidationError::Invalid { field, .. } = e;
+            field == "agent.idle_timeout"
+        })
+    }
+
+    fn spec_with(idle: Option<u64>, max: Option<u64>) -> AgentSpec {
+        let mut s = super::tests::base();
+        s.agent.idle_timeout = idle;
+        s.agent.max_turn_duration = max;
+        s
+    }
+
+    #[test]
+    fn an_idle_timeout_at_or_above_the_turn_cap_is_refused() {
+        // The combination buzz-acp rejects at startup. Without this the spec
+        // validates, hived reconciles it, and the agent crash-loops with the
+        // reason only in `docker logs` — which is how it was found.
+        for (idle, max) in [(900, 600), (600, 600)] {
+            assert!(has_idle_error(&spec_with(Some(idle), Some(max))), "accepted idle={idle} max={max}");
+        }
+    }
+
+    #[test]
+    fn a_sane_pair_and_a_partial_one_are_both_fine() {
+        assert!(!has_idle_error(&spec_with(Some(300), Some(600))));
+        // Only one set: the other takes a default this crate does not own, so
+        // there is nothing to compare against and guessing would reject valid
+        // specs.
+        for (idle, max) in [(Some(900), None), (None, Some(600)), (None, None)] {
+            assert!(!has_idle_error(&spec_with(idle, max)), "rejected {idle:?}/{max:?}");
+        }
     }
 }
