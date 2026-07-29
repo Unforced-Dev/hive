@@ -317,45 +317,90 @@ pub fn authorize(
         // the URL above is printed first precisely so it stays usable there.
         let _ = Command::new("open").arg(&url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
     }
-    println!("Waiting for the redirect on 127.0.0.1:{port} …");
+    println!("Waiting for the redirect on 127.0.0.1:{port}");
+    println!("…or paste the callback URL here and press enter:");
 
-    let (mut sock, _) = listener.accept().context("waiting for the OAuth redirect")?;
-    let mut reader = BufReader::new(sock.try_clone()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    // Two ways in, whichever arrives first.
+    //
+    // The listener alone is not enough. `redirect_uri` is loopback, so it only
+    // resolves on the machine running this command — and an agent host is
+    // exactly the machine nobody is sitting at. Authorizing from a laptop then
+    // leaves a browser stuck on a dead address while the box waits forever.
+    //
+    // Pasting the URL is the same escape hatch Claude Code offers for MCP
+    // auth, and it costs nothing: the code is single-use, PKCE-bound and
+    // state-checked either way, so accepting it over the terminal is no
+    // weaker than accepting it over loopback.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<BTreeMap<String, String>>>();
 
-    let query = request_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|p| p.split_once('?').map(|(_, q)| q.to_string()))
-        .unwrap_or_default();
-    let params: BTreeMap<&str, &str> =
-        query.split('&').filter_map(|kv| kv.split_once('=')).collect();
+    let tx_sock = tx.clone();
+    std::thread::spawn(move || {
+        let got = (|| -> Result<(BTreeMap<String, String>, std::net::TcpStream)> {
+            let (sock, _) = listener.accept().context("waiting for the OAuth redirect")?;
+            let mut reader = BufReader::new(sock.try_clone()?);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let query = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.split_once('?').map(|(_, q)| q.to_string()))
+                .unwrap_or_default();
+            Ok((parse_query(&query), sock))
+        })();
+        match got {
+            Ok((params, mut sock)) => {
+                let ok = params.contains_key("code");
+                let msg = if ok { "hive is authorized" } else { "Authorization failed" };
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body style=\"font-family:system-ui;padding:3rem\"><h2>{msg}</h2><p>You can close this tab.</p></body></html>"
+                );
+                let _ = tx_sock.send(Ok(params));
+            }
+            Err(e) => {
+                let _ = tx_sock.send(Err(e));
+            }
+        }
+    });
 
-    let reply = |sock: &mut std::net::TcpStream, msg: &str| {
-        let _ = write!(
-            sock,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body style=\"font-family:system-ui;padding:3rem\"><h2>{msg}</h2><p>You can close this tab.</p></body></html>"
-        );
-    };
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            let t = line.trim();
+            if !t.is_empty() {
+                // Accept a whole URL or a bare query string, since what people
+                // copy out of an address bar is inconsistent.
+                let q = t.split_once('?').map(|(_, q)| q).unwrap_or(t);
+                let _ = tx.send(Ok(parse_query(q)));
+            }
+        }
+    });
+
+    let params = rx.recv().context("no callback received")??;
 
     if let Some(err) = params.get("error") {
-        reply(&mut sock, "Authorization failed");
         bail!("authorization server refused: {err}");
     }
-    // Compare state before touching the code: without this a redirect from an
-    // unrelated flow would be accepted and exchanged.
-    if params.get("state").map(|s| *s != state).unwrap_or(true) {
-        reply(&mut sock, "Authorization failed");
-        bail!("state mismatch — the redirect did not belong to this login attempt");
+    // Check state before touching the code: without this a redirect belonging
+    // to an unrelated flow would be accepted and exchanged.
+    if params.get("state").map(|s| s != &state).unwrap_or(true) {
+        bail!("state mismatch — that callback did not belong to this login attempt");
     }
     let code = params
         .get("code")
-        .map(|c| percent_decode(c))
-        .context("redirect carried no authorization code")?;
-    reply(&mut sock, "hive is authorized");
+        .cloned()
+        .context("callback carried no authorization code")?;
 
     Ok((code, format!("{verifier}\u{1}{redirect_uri}")))
+}
+
+/// Percent-decoded query pairs. Owned rather than borrowed because the two
+/// arrival paths (socket, stdin) own their buffers in different threads.
+fn parse_query(q: &str) -> BTreeMap<String, String> {
+    q.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (percent_decode(k), percent_decode(v)))
+        .collect()
 }
 
 fn percent_decode(s: &str) -> String {
@@ -498,6 +543,41 @@ mod tests {
         // derived key; a refresh token left behind still mints access tokens.
         assert_eq!(refresh_key("mcp/parachute"), "mcp/parachute+refresh");
         assert_eq!(meta_key("mcp/parachute"), "mcp/parachute+oauth");
+    }
+
+    #[test]
+    fn a_pasted_callback_parses_as_a_whole_url_or_a_bare_query() {
+        // People copy inconsistent things out of an address bar, and a paste
+        // that silently yields no code sends them looking at the server.
+        let want = |m: &BTreeMap<String, String>| {
+            assert_eq!(m.get("code").map(String::as_str), Some("abc123"));
+            assert_eq!(m.get("state").map(String::as_str), Some("xyz"));
+        };
+        want(&parse_query("code=abc123&state=xyz"));
+        want(&parse_query(
+            "http://127.0.0.1:51940/callback?code=abc123&state=xyz"
+                .split_once('?')
+                .unwrap()
+                .1,
+        ));
+    }
+
+    #[test]
+    fn a_pasted_callback_is_percent_decoded() {
+        // Authorization codes routinely contain '/' and '+', which arrive
+        // escaped. Exchanging the raw form fails with "invalid_grant" against
+        // a code that looks correct on screen.
+        let m = parse_query("code=a%2Fb%2Bc&state=s");
+        assert_eq!(m.get("code").map(String::as_str), Some("a/b+c"));
+    }
+
+    #[test]
+    fn an_error_callback_is_distinguishable_from_a_successful_one() {
+        // The server redirects with ?error=... rather than a code; treating a
+        // missing code as "still waiting" would hang instead of reporting the
+        // refusal.
+        let m = parse_query("error=access_denied&state=s");
+        assert!(m.contains_key("error") && !m.contains_key("code"));
     }
 
     #[test]
