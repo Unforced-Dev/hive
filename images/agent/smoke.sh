@@ -42,6 +42,41 @@ probe() {
     fi
 }
 
+# --- persistence ------------------------------------------------------------
+# Every path an agent writes to must resolve ONTO the state volume. A path left
+# on the container's ephemeral layer looks perfect until the first recreate —
+# which a spec edit triggers — and then the data is gone with no error anywhere.
+#
+# This exists because two of them were wrong at once: $GROK_HOME pointed at the
+# read-only install, and /home/agent/work was a plain directory in the image, so
+# an agent's working files were deleted on every recreate while its sessions and
+# credentials survived. Both read fine in the Dockerfile.
+STATE="${HIVE_STATE_DIR:-/home/agent/state}"
+
+persists() {
+    name="$1"; path="$2"
+    real=$(readlink -f "$path" 2>/dev/null)
+    case "$real" in
+        "$STATE"|"$STATE"/*) printf '  %-10s PASS  %s\n' "$name" "$real" ;;
+        "") printf '  %-10s FAIL  %s does not exist\n' "$name" "$path"; fail=1 ;;
+        *)  printf '  %-10s FAIL  %s -> %s is NOT on the state volume\n' \
+                "$name" "$path" "$real"; fail=1 ;;
+    esac
+}
+
+echo "persistence:"
+persists work     "$HOME/work"
+persists grok     "${GROK_HOME:-$HOME/.grok}"
+persists claude   "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+persists codex    "${CODEX_HOME:-$HOME/.codex}"
+persists kimi     "$HOME/.kimi"
+persists cursor   "$HOME/.cursor"
+persists opencode "$HOME/.opencode"
+persists omp      "$HOME/.omp"
+persists amp      "${AMP_HOME:-$HOME/.amp}"
+echo
+echo "acp:"
+
 # The probe table. Kept in sync with hive-core's harness catalog by a test in
 # crates/hive-core/src/lib.rs — edit the catalog, not just this list.
 # HARNESS_TABLE_BEGIN

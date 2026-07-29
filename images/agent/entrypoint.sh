@@ -31,6 +31,13 @@ link_state() {
         ln -sfn "$target" "$HOME/$name"
     fi
 }
+# The agent's working directory. NOT decoration: hive-acp redirects the
+# client's cwd here, so this is where an agent actually writes. Left as a plain
+# directory in the image it sits on the container's ephemeral layer, and every
+# recreate — which a spec edit triggers — silently deletes the agent's work
+# while its sessions and credentials survive on the volume.
+link_state work       work
+
 link_state .grok      grok
 link_state .kimi      kimi
 link_state .cursor    cursor

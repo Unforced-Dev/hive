@@ -310,7 +310,13 @@ ENV GROK_HOME=/home/agent/state/grok
 # thing every harness does is fail: goose panics on "Failed to create session
 # database directory", opencode dies with EACCES on mkdir. Creating the
 # directory here first means the volume inherits agent ownership instead.
-RUN mkdir -p /home/agent/state /home/agent/work \
+# /home/agent/work is deliberately NOT created here. As a real directory in the
+# image it lands on the container's ephemeral layer, and since hive-acp points
+# the client's cwd at it, every recreate would silently delete the agent's work
+# while its sessions and credentials survived on the volume. The entrypoint
+# links it into the state volume instead — and `link_state` will not replace a
+# real directory, so creating one here would defeat it.
+RUN mkdir -p /home/agent/state \
  && test -w /home/agent/state
 
 VOLUME ["/home/agent/state"]
