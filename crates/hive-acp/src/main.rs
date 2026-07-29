@@ -87,6 +87,10 @@ struct Config {
     argv: Vec<String>,
     /// HTTP MCP servers from this agent's spec, injected at `session/new`.
     mcp: Vec<McpEntry>,
+    /// Env vars this harness's model-provider credential can arrive in.
+    credential_env: Vec<String>,
+    /// The spec's own harness id, when `HIVE_HARNESS` overrode it.
+    overridden: Option<String>,
 }
 
 #[derive(Clone)]
@@ -533,25 +537,53 @@ fn resolve() -> Result<Config> {
     // is honoured here too: a harness the catalog does not know still runs, it
     // just brings its own image, and refusing it would make hive-acp stricter
     // than hived about the very same spec.
-    let argv: Vec<String> = match (&spec.harness.id, &spec.harness.command) {
+    // `HIVE_HARNESS` overrides the spec's harness id.
+    //
+    // The image carries every harness in the catalog, so one container can run
+    // any of them — which is what lets a single `hive-acp` binary back several
+    // Buzz harness entries (`hive (claude)`, `hive (codex)`, …) instead of one
+    // per agent. Buzz's harness picker then stays the harness picker, and each
+    // entry reports the models its own harness actually supports rather than a
+    // merged list hive would have to maintain.
+    //
+    // What it does NOT move is credentials. hived provisions the container from
+    // the spec, so the only model-provider credential present is the spec
+    // harness's. Overriding to a harness the container cannot authenticate is
+    // allowed — refusing would make it impossible to start a container in order
+    // to log in — but it is called out below rather than left to surface as an
+    // unexplained "authentication required" three steps later.
+    let override_id = std::env::var("HIVE_HARNESS").ok().filter(|s| !s.is_empty());
+    let effective_id = override_id.as_deref().or(spec.harness.id.as_deref());
+
+    let mut credential_env: Vec<String> = Vec::new();
+    let argv: Vec<String> = match (effective_id, &spec.harness.command) {
         (Some(id), _) => {
-            let def = CATALOG.iter().find(|h| h.id == id.as_str()).with_context(|| {
+            let def = CATALOG.iter().find(|h| h.id == id).with_context(|| {
                 format!(
-                    "{agent} names harness {id:?}, which is not in hive's catalog. \
+                    "harness {id:?} is not in hive's catalog. \
                      `hive harnesses` lists the ids this build knows."
                 )
             })?;
             if let Some(reason) = &def.unsupported {
                 bail!("harness {id:?} is deliberately absent from the image: {reason:?}");
             }
+            credential_env = def.credential_env.iter().map(|s| s.to_string()).collect();
             let mut v = vec![def.command.to_string()];
             v.extend(def.args.iter().map(|s| s.to_string()));
             v
         }
+        // An explicit command wins only when no id is in play at all. A spec
+        // that names both, plus an override, would otherwise silently run the
+        // command and ignore the harness that was just picked.
         (None, Some(cmd)) => cmd.split_whitespace().map(String::from).collect(),
         (None, None) => bail!(
             "{agent} names neither [harness].id nor [harness].command, so there is nothing to run"
         ),
+    };
+
+    let overridden = match (&override_id, &spec.harness.id) {
+        (Some(o), Some(s)) if o != s => Some(s.clone()),
+        _ => None,
     };
 
     // Only HTTP servers are attached over ACP. A stdio server in a spec is
@@ -573,7 +605,43 @@ fn resolve() -> Result<Config> {
         agent,
         argv,
         mcp,
+        credential_env,
+        overridden,
     })
+}
+
+/// Warn when the chosen harness has no credential in the container.
+///
+/// Only worth saying when the harness was overridden: for the spec's own
+/// harness, hived already refuses to start the agent without its credential, so
+/// a missing one there is not this program's news to break.
+fn warn_if_unauthenticated(cfg: &Config) {
+    let Some(spec_harness) = &cfg.overridden else {
+        return;
+    };
+    if cfg.credential_env.is_empty() {
+        return;
+    }
+    let present = cfg.credential_env.iter().any(|var| {
+        Command::new(find_docker())
+            .args(["exec", &cfg.container, "printenv", var])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    if !present {
+        eprintln!(
+            "hive-acp: harness overridden to {} but this container was provisioned for {spec_harness}, \
+             so none of {} is set. The harness will report that authentication is required. \
+             Give {} its own agent, or add the credential to {}'s spec.",
+            cfg.argv.first().map(String::as_str).unwrap_or("?"),
+            cfg.credential_env.join(" / "),
+            cfg.argv.first().map(String::as_str).unwrap_or("the harness"),
+            cfg.agent,
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -594,6 +662,7 @@ fn main() -> Result<()> {
         cfg.container,
         cfg.argv.join(" ")
     );
+    warn_if_unauthenticated(&cfg);
 
     // -i, no -t. There is no terminal here, and `docker exec -t` fails outright
     // when stdin is a pipe — which it always is, because buzz-acp owns it.
