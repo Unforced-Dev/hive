@@ -89,6 +89,8 @@ struct Config {
     mcp: Vec<McpEntry>,
     /// Env vars this harness's model-provider credential can arrive in.
     credential_env: Vec<String>,
+    /// Where a file-shaped credential for this harness would be, if it has one.
+    credential_file: Option<String>,
     /// The spec's own harness id, when `HIVE_HARNESS` overrode it.
     overridden: Option<String>,
 }
@@ -556,6 +558,7 @@ fn resolve() -> Result<Config> {
     let effective_id = override_id.as_deref().or(spec.harness.id.as_deref());
 
     let mut credential_env: Vec<String> = Vec::new();
+    let mut credential_file: Option<String> = None;
     let argv: Vec<String> = match (effective_id, &spec.harness.command) {
         (Some(id), _) => {
             let def = CATALOG.iter().find(|h| h.id == id).with_context(|| {
@@ -568,6 +571,7 @@ fn resolve() -> Result<Config> {
                 bail!("harness {id:?} is deliberately absent from the image: {reason:?}");
             }
             credential_env = def.credential_env.iter().map(|s| s.to_string()).collect();
+            credential_file = def.credential_file.map(String::from);
             let mut v = vec![def.command.to_string()];
             v.extend(def.args.iter().map(|s| s.to_string()));
             v
@@ -606,6 +610,7 @@ fn resolve() -> Result<Config> {
         argv,
         mcp,
         credential_env,
+        credential_file,
         overridden,
     })
 }
@@ -619,10 +624,17 @@ fn warn_if_unauthenticated(cfg: &Config) {
     let Some(spec_harness) = &cfg.overridden else {
         return;
     };
-    if cfg.credential_env.is_empty() {
+    if cfg.credential_env.is_empty() && cfg.credential_file.is_none() {
         return;
     }
-    let present = cfg.credential_env.iter().any(|var| {
+
+    // Subscription auth is the normal way these tools are used, and for codex
+    // it is a file rather than an env var. Checking only the environment
+    // reported a working container as unauthenticated — the warning fired, and
+    // then codex authenticated from auth.json and listed its models. A false
+    // alarm here is worse than none: it teaches the reader to ignore the line
+    // that will one day be true.
+    let env_present = cfg.credential_env.iter().any(|var| {
         Command::new(find_docker())
             .args(["exec", &cfg.container, "printenv", var])
             .stdout(Stdio::null())
@@ -631,17 +643,37 @@ fn warn_if_unauthenticated(cfg: &Config) {
             .map(|s| s.success())
             .unwrap_or(false)
     });
-    if !present {
-        eprintln!(
-            "hive-acp: harness overridden to {} but this container was provisioned for {spec_harness}, \
-             so none of {} is set. The harness will report that authentication is required. \
-             Give {} its own agent, or add the credential to {}'s spec.",
-            cfg.argv.first().map(String::as_str).unwrap_or("?"),
-            cfg.credential_env.join(" / "),
-            cfg.argv.first().map(String::as_str).unwrap_or("the harness"),
-            cfg.agent,
-        );
+    let file_present = cfg
+        .credential_file
+        .as_deref()
+        .is_some_and(|path| file_exists_in(&cfg.container, path));
+    if env_present || file_present {
+        return;
     }
+
+    let harness = cfg.argv.first().map(String::as_str).unwrap_or("the harness");
+    let mut wanted = cfg.credential_env.clone();
+    if let Some(path) = &cfg.credential_file {
+        wanted.push(path.clone());
+    }
+    eprintln!(
+        "hive-acp: harness overridden to {harness} but this container was provisioned for \
+         {spec_harness}, and none of {} is present. The harness will report that authentication \
+         is required. Give {harness} its own agent, or add its credential to {}'s spec.",
+        wanted.join(" / "),
+        cfg.agent,
+    );
+}
+
+/// Is this an existing regular file inside the container?
+fn file_exists_in(container: &str, path: &str) -> bool {
+    Command::new(find_docker())
+        .args(["exec", container, "test", "-f", path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn main() -> Result<()> {
