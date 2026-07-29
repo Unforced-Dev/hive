@@ -1,0 +1,11 @@
+{
+  "id": "hive",
+  "label": "hive (containerized)",
+  "command": "hive-acp",
+  "args": [],
+  "env": {
+    "HIVE_AGENT": "CHANGE-ME"
+  },
+  "install_instructions_url": "https://github.com/Unforced-Dev/hive#install",
+  "install_hint": "cargo install --path crates/hive-acp, then set HIVE_AGENT to the agent whose spec and container this should run."
+}

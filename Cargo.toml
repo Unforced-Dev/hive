@@ -7,6 +7,7 @@ members = [
     "crates/hive-headers",
     "crates/hived",
     "crates/hive-cli",
+    "crates/hive-acp",
     "crates/buzz-backend-hive",
 ]
 
