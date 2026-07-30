@@ -574,6 +574,27 @@ fn chosen_harness() -> Option<String> {
     flag("harness").or_else(|| std::env::var("HIVE_HARNESS").ok().filter(|s| !s.is_empty()))
 }
 
+/// Where operator-wide environment defaults live.
+///
+/// On the secrets volume rather than the spec directory, because hived reads
+/// every `*.toml` in the latter as an agent and would try to reconcile this
+/// one.
+const DEFAULTS_PATH: &str = "/var/lib/hive/defaults.toml";
+
+/// TOML appended to every environment hive creates. Empty when absent.
+fn read_defaults(daemon: &str) -> String {
+    Command::new(find_docker())
+        .args(["exec", daemon, "cat", DEFAULTS_PATH])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            if text.trim().is_empty() { text } else { format!("\n{}", text.trim_end()) }
+        })
+        .unwrap_or_default()
+}
+
 /// Create an environment that does not exist yet, through the daemon.
 ///
 /// Deliberately minimal. An environment is a container to run a harness in:
@@ -643,6 +664,22 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
         }
     };
 
+    // Anything the operator wants every new environment to have.
+    //
+    // Without this a generated environment has no MCP servers at all, so the
+    // vault every agent is supposed to reach is reachable only from the one
+    // environment somebody configured by hand. Defaults are appended verbatim
+    // and validated by `spec-put`, so a broken defaults file fails at creation
+    // with a reason rather than producing an agent that quietly lacks its
+    // tools.
+    //
+    // NOT in the spec directory: hived treats every *.toml there as an agent,
+    // so a defaults file next to the specs would be reconciled as one.
+    let defaults = read_defaults(daemon);
+    if !defaults.trim().is_empty() {
+        eprintln!("hive-acp: applying environment defaults from {DEFAULTS_PATH}");
+    }
+
     let spec = format!(
         "# Created by hive-acp for Buzz agent {name:?}.\n\
          # An environment: a container to run a harness in. The identity lives\n\
@@ -655,7 +692,8 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
          {auth_block}\
          \n\
          [agent]\n\
-         mode = \"environment\"\n"
+         mode = \"environment\"\n\
+         {defaults}"
     );
 
     eprintln!("hive-acp: {name:?} has no environment yet; creating one (harness {harness})");
