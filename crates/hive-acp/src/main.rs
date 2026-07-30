@@ -495,6 +495,23 @@ mod tests {
     }
 }
 
+/// Every credential key the broker currently holds.
+fn stored_secrets(daemon: &str) -> Vec<String> {
+    Command::new(find_docker())
+        .args(["exec", daemon, "hive", "secret", "list"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Name the credentials this spec needs that the broker does not hold.
 ///
 /// hived HOLDS an agent whose credentials are missing rather than starting one
@@ -569,6 +586,45 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "claude".to_string());
 
+    // Reuse a credential this box already holds, in the FORM the harness reads
+    // it.
+    //
+    // Defaulting to broker+env is right for claude, whose credential is a token
+    // in CLAUDE_CODE_OAUTH_TOKEN — and wrong for codex and grok, whose normal
+    // auth is a JSON file. A spec that asks for `harness/codex` when what exists
+    // is `codex/auth` is held forever for a credential nobody is going to
+    // create, and the new agent simply never starts.
+    //
+    // Both key spellings are tried because both are in use: `harness/<id>` is
+    // what hive asks for by default, `<id>/auth` is what a file credential gets
+    // called when it is stored by hand.
+    let held = stored_secrets(daemon);
+    let file_auth = CATALOG
+        .iter()
+        .find(|h| h.id == harness)
+        .and_then(|h| h.credential_file)
+        .and_then(|path| {
+            [format!("harness/{harness}"), format!("{harness}/auth")]
+                .into_iter()
+                .find(|k| held.iter().any(|h| h == k))
+                .map(|key| (key, path))
+        });
+
+    let auth_block = match &file_auth {
+        Some((key, path)) => {
+            eprintln!("hive-acp: {harness} authenticates from a file; using {key}");
+            format!(
+                "auth = \"file\"\n\
+                 \n\
+                 [[file]]\n\
+                 credential = {key:?}\n\
+                 target     = {path:?}\n\
+                 mode       = \"0600\"\n"
+            )
+        }
+        None => String::new(),
+    };
+
     let spec = format!(
         "# Created by hive-acp for Buzz agent {name:?}.\n\
          # An environment: a container to run a harness in. The identity lives\n\
@@ -578,6 +634,7 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
          \n\
          [harness]\n\
          id = {harness:?}\n\
+         {auth_block}\
          \n\
          [agent]\n\
          mode = \"environment\"\n"
@@ -634,6 +691,17 @@ fn env_name() -> Result<String> {
             "hive-acp: HIVE_AGENT is deprecated, use HIVE_ENV. It selects a container, not an \
              identity — and two Buzz agents sharing one value share one container."
         );
+        return Ok(v);
+    }
+    // Fall back to the name the supervisor gave this agent.
+    //
+    // A deployed agent should not need an environment variable set by hand
+    // before it can run at all, and asking for one invites the mistake it was
+    // meant to prevent: reusing a neighbour's value, and silently sharing that
+    // container's sessions, skills and credentials. buzz-host publishes its
+    // unit name, which is already unique per agent on that machine.
+    if let Some(v) = read("BUZZ_HOST_UNIT") {
+        eprintln!("hive-acp: HIVE_ENV unset; using this agent's unit name {v:?}");
         return Ok(v);
     }
     bail!(
