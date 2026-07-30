@@ -169,7 +169,17 @@ fn pass(
         if !needs_broker || listeners.contains(name) {
             continue;
         }
-        let socket = args.socket_dir.join(format!("{name}.sock"));
+        // One directory per agent, holding one socket. The container mounts the
+        // DIRECTORY — see `broker_mount` — so the daemon can recreate this
+        // socket on restart without orphaning a running container's mount.
+        let agent_dir = args.socket_dir.join(name);
+        if let Err(e) = std::fs::create_dir_all(&agent_dir) {
+            tracing::error!(agent = %name, error = %e, "cannot create the broker socket directory");
+            continue;
+        }
+        // 0755: the agent container connects as uid 1001 and must traverse it.
+        let _ = std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o755));
+        let socket = agent_dir.join("broker.sock");
         let broker_for_thread = Arc::clone(broker);
         let registry_for_thread = Arc::clone(registry);
         let agent_name = name.clone();
