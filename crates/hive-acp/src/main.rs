@@ -820,67 +820,77 @@ fn env_name() -> String {
 /// the environment would let the two disagree — and the symptom would be a
 /// harness that starts, answers `initialize`, and has none of the credentials
 /// the container was built for.
+/// Read an environment's spec through the daemon, or locally when visible.
+///
+/// Where hived runs in a container — which on macOS and Windows it must,
+/// because the broker's unix sockets cannot cross the Docker VM boundary — the
+/// spec directory is a volume this process cannot see. Requiring the operator
+/// to bind-mount it onto the host as well would mean two sources of truth for
+/// the same file, and the one this program read would be the one nobody edited.
+fn read_spec(spec_dir: &str, daemon: &str, name: &str) -> Option<String> {
+    let path = std::path::Path::new(spec_dir).join(format!("{name}.toml"));
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        return Some(t);
+    }
+    let out = Command::new(find_docker())
+        .args(["exec", daemon, "cat"])
+        .arg(&path)
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 fn resolve() -> Result<Config> {
-    let agent = env_name();
+    let mut agent = env_name();
 
     let spec_dir =
         std::env::var("HIVE_SPEC_DIR").unwrap_or_else(|_| "/etc/hive/agents".to_string());
-    let path = std::path::Path::new(&spec_dir).join(format!("{agent}.toml"));
+    let daemon = std::env::var("HIVE_DAEMON_CONTAINER").unwrap_or_else(|_| "hived".to_string());
 
-    // Read the spec locally when it is there, and through the daemon container
-    // when it is not.
+    // Creating an environment is for a REAL agent, never for a model-discovery
+    // probe.
     //
-    // Where hived runs in a container — which on macOS and Windows it must,
-    // because the broker's unix sockets cannot cross the Docker VM boundary —
-    // the spec directory is a volume this process cannot see. Requiring the
-    // operator to bind-mount it onto the host as well would mean two sources of
-    // truth for the same file, and the one this program read would be the one
-    // nobody edited.
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(local_err) => {
-            let daemon =
-                std::env::var("HIVE_DAEMON_CONTAINER").unwrap_or_else(|_| "hived".to_string());
-            let out = Command::new(find_docker())
-                .args(["exec", &daemon, "cat"])
-                .arg(&path)
-                .output()
-                .with_context(|| format!("reading {} via {daemon}", path.display()))?;
-            if !out.status.success() {
-                // No spec: create one rather than making the operator author a
-                // file before an agent can exist.
-                //
-                // An environment is nearly contentless — a harness id and a
-                // mode — because identity belongs to whatever spawned this and
-                // credentials are named, not stored, here. So there is nothing
-                // to invent and nothing to get wrong, which is what makes
-                // generating it safe rather than magic. Without this, every new
-                // Buzz agent needs a hand-written TOML on the host first, and
-                // the pressure is to point them all at one existing spec — which
-                // silently puts them in ONE container, sharing sessions, skills
-                // and credentials.
-                create_environment(&daemon, &agent)?;
-                let retry = Command::new(find_docker())
-                    .args(["exec", &daemon, "cat"])
-                    .arg(&path)
-                    .output()
-                    .with_context(|| format!("reading {} via {daemon}", path.display()))?;
-                if !retry.status.success() {
-                    bail!(
-                        "cannot read {}: locally {local_err}; via container {daemon}: {}. \
-                         Is hived running? `hive status`",
-                        path.display(),
-                        String::from_utf8_lossy(&retry.stderr).trim()
-                    );
+    // The desktop re-probes the harness on every keystroke while someone types
+    // into the HIVE_ENV field, so provisioning unconditionally created one
+    // environment per keystroke: typing "uni" left behind `u` and `un`, each
+    // with a spec, a container and a volume, all within the same second.
+    //
+    // A deployed agent carries BUZZ_HOST_UNIT — its supervisor named it. A
+    // probe does not. So a probe naming an environment that does not exist
+    // falls back to the shared discovery one rather than conjuring it.
+    let text = match read_spec(&spec_dir, &daemon, &agent) {
+        Some(t) => t,
+        None => {
+            let deployed =
+                std::env::var("BUZZ_HOST_UNIT").ok().filter(|s| !s.is_empty()).is_some();
+            if !deployed {
+                let scratch =
+                    format!("probe-{}", chosen_harness().unwrap_or_else(|| "claude".into()));
+                eprintln!(
+                    "hive-acp: {agent:?} does not exist and nothing has deployed it, so this is \
+                     a discovery probe — using {scratch:?} instead of creating it. Deploy the \
+                     agent, or create the environment with `hive spec-put`."
+                );
+                agent = scratch;
+            }
+            match read_spec(&spec_dir, &daemon, &agent) {
+                Some(t) => t,
+                None => {
+                    // Either a real deployment whose environment does not exist
+                    // yet, or the discovery environment on its first ever use.
+                    create_environment(&daemon, &agent)?;
+                    read_spec(&spec_dir, &daemon, &agent).with_context(|| {
+                        format!(
+                            "created {agent} but still cannot read its spec via {daemon}. \
+                             Is hived running? `hive status`"
+                        )
+                    })?
                 }
-                String::from_utf8(retry.stdout).context("spec was not valid UTF-8")?
-            } else {
-                String::from_utf8(out.stdout).context("spec was not valid UTF-8")?
             }
         }
     };
-    let spec: AgentSpec =
-        toml::from_str(&text).with_context(|| format!("{} is not a valid agent spec", path.display()))?;
+    let spec: AgentSpec = toml::from_str(&text)
+        .with_context(|| format!("{agent} does not have a valid agent spec"))?;
 
     // A spec names either a catalog id or an explicit command. The escape hatch
     // is honoured here too: a harness the catalog does not know still runs, it
