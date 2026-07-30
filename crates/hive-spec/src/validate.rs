@@ -75,56 +75,75 @@ pub fn validate(spec: &AgentSpec) -> ValidationReport {
     let mut r = ValidationReport::default();
 
     // ---- identity ----
-    if !is_hex64(&spec.identity.pubkey) {
-        r.errors.push(ValidationError::new(
-            "identity.pubkey",
-            "must be 64 lowercase hex characters",
-        ));
-    }
-    if !spec.identity.relay_url.starts_with("ws://")
-        && !spec.identity.relay_url.starts_with("wss://")
-    {
-        r.errors.push(ValidationError::new(
-            "identity.relay_url",
-            "must be a ws:// or wss:// URL",
-        ));
-    }
-
-    // Without an owner the harness drops every event and sits idle — no error,
-    // no log line, just an agent that never answers. Catch it here rather than
-    // letting someone debug a silent agent.
-    if spec.identity.owner_pubkey.is_none() && spec.identity.auth_tag.is_none() {
-        r.errors.push(ValidationError::new(
+    //
+    // Required only where hive runs buzz-acp itself. An environment container
+    // has no identity by design — the process holding the key runs outside it —
+    // and demanding one there produced specs carrying a pubkey nothing reads.
+    let is_relay = spec.agent.mode.unwrap_or_default() == crate::AgentMode::Relay;
+    match (&spec.identity, is_relay) {
+        (None, true) => r.errors.push(ValidationError::new(
             "identity",
-            "one of owner_pubkey or auth_tag is required — without either, \
-             the harness silently drops every event and the agent never responds",
-        ));
-    }
-    if let Some(owner) = &spec.identity.owner_pubkey
-        && !is_hex64(owner)
-    {
-        r.errors.push(ValidationError::new(
-            "identity.owner_pubkey",
-            "must be 64 lowercase hex characters",
-        ));
-    }
-    if spec.identity.owner_pubkey.is_some() && spec.identity.auth_tag.is_none() {
-        r.warnings.push(
-            "identity: using owner_pubkey without auth_tag — the agent needs its own \
-             relay membership. A NIP-OA auth_tag would let it derive access from its \
-             owner's membership instead, so revoking the human revokes the agent."
+            "required for mode = \"relay\": this container runs buzz-acp itself, \
+             which cannot join a relay without a key, a url and an owner",
+        )),
+        (Some(_), false) => r.warnings.push(
+            "identity is set but mode = \"environment\": nothing reads it. buzz-acp \
+             runs outside this container and holds the identity itself."
                 .into(),
-        );
+        ),
+        _ => {}
     }
 
-    if let Some(c) = &spec.identity.credential
-        && looks_like_a_secret(c)
-    {
-        r.errors.push(ValidationError::new(
-            "identity.credential",
-            "this is a broker KEY, not the private key itself — store the value with \
-             `hive secret put` and name it here",
-        ));
+    if let Some(identity) = &spec.identity {
+        if !is_hex64(&identity.pubkey) {
+            r.errors.push(ValidationError::new(
+                "identity.pubkey",
+                "must be 64 lowercase hex characters",
+            ));
+        }
+        if !identity.relay_url.starts_with("ws://") && !identity.relay_url.starts_with("wss://") {
+            r.errors.push(ValidationError::new(
+                "identity.relay_url",
+                "must be a ws:// or wss:// URL",
+            ));
+        }
+
+        // Without an owner the harness drops every event and sits idle — no
+        // error, no log line, just an agent that never answers. Catch it here
+        // rather than letting someone debug a silent agent.
+        if identity.owner_pubkey.is_none() && identity.auth_tag.is_none() {
+            r.errors.push(ValidationError::new(
+                "identity",
+                "one of owner_pubkey or auth_tag is required — without either, \
+                 the harness silently drops every event and the agent never responds",
+            ));
+        }
+        if let Some(owner) = &identity.owner_pubkey
+            && !is_hex64(owner)
+        {
+            r.errors.push(ValidationError::new(
+                "identity.owner_pubkey",
+                "must be 64 lowercase hex characters",
+            ));
+        }
+        if identity.owner_pubkey.is_some() && identity.auth_tag.is_none() {
+            r.warnings.push(
+                "identity: using owner_pubkey without auth_tag — the agent needs its own \
+                 relay membership. A NIP-OA auth_tag would let it derive access from its \
+                 owner's membership instead, so revoking the human revokes the agent."
+                    .into(),
+            );
+        }
+
+        if let Some(c) = &identity.credential
+            && looks_like_a_secret(c)
+        {
+            r.errors.push(ValidationError::new(
+                "identity.credential",
+                "this is a broker KEY, not the private key itself — store the value with \
+                 `hive secret put` and name it here",
+            ));
+        }
     }
 
     // ---- harness ----
@@ -166,6 +185,25 @@ pub fn validate(spec: &AgentSpec) -> ValidationReport {
                     .into(),
             );
         }
+    }
+
+    // buzz-acp refuses to start unless idle_timeout < max_turn_duration: the
+    // wall-clock cap would otherwise fire first and make idle_timeout a dead
+    // letter. Checked here as well because the container is where that refusal
+    // happens — `hive validate` said the spec was fine, hived reconciled it, and
+    // the agent crash-looped with the reason visible only in `docker logs`.
+    // Found by deploying one.
+    if let (Some(idle), Some(max)) = (spec.agent.idle_timeout, spec.agent.max_turn_duration)
+        && idle >= max
+    {
+        r.errors.push(ValidationError::new(
+            "agent.idle_timeout",
+            format!(
+                "must be less than max_turn_duration ({max}s), got {idle}s — the harness \
+                 refuses to start, because the wall-clock cap would fire before the idle \
+                 timeout ever could"
+            ),
+        ));
     }
     if let Some(p) = spec.agent.parallelism
         && p == 0
@@ -347,23 +385,23 @@ fn parse_memory_gb(s: &str) -> Option<f64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::*;
     use std::collections::BTreeMap;
 
     const PK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn base() -> AgentSpec {
+    pub(crate) fn base() -> AgentSpec {
         AgentSpec {
-            identity: Identity {
+            identity: Some(Identity {
                 pubkey: PK.into(),
                 relay_url: "wss://buzz.example.org".into(),
                 owner_pubkey: Some(PK.into()),
                 auth_tag: None,
                 credential: None,
-            },
-            harness: Harness { id: Some("claude".into()), command: None, image: None, auth: HarnessAuth::Broker },
+            }),
+            harness: Harness { id: Some("claude".into()), command: None, image: None, auth: HarnessAuth::Broker, credential: None },
             agent: AgentConfig { observer: true, ..Default::default() },
             resources: Resources::default(),
             network: Network::default(),
@@ -385,8 +423,8 @@ mod tests {
     #[test]
     fn missing_owner_is_an_error_not_a_silent_idle_agent() {
         let mut s = base();
-        s.identity.owner_pubkey = None;
-        s.identity.auth_tag = None;
+        s.identity.as_mut().unwrap().owner_pubkey = None;
+        s.identity.as_mut().unwrap().auth_tag = None;
         let r = s.validate();
         assert!(!r.is_ok());
         assert!(r.errors.iter().any(|e| e.to_string().contains("owner_pubkey or auth_tag")));
@@ -539,7 +577,7 @@ mod tests {
     #[test]
     fn explicit_command_requires_explicit_image() {
         let mut s = base();
-        s.harness = Harness { id: None, command: Some("opencode acp".into()), image: None, auth: HarnessAuth::Broker };
+        s.harness = Harness { id: None, command: Some("opencode acp".into()), image: None, auth: HarnessAuth::Broker, credential: None };
         assert!(!s.validate().is_ok());
 
         s.harness.image = Some("hive/harness-opencode:1.4.2".into());
@@ -600,5 +638,45 @@ mod tests {
         let text = s.to_toml().expect("serialises");
         let back = AgentSpec::from_toml(&text).expect("parses");
         assert_eq!(s, back);
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    fn has_idle_error(s: &AgentSpec) -> bool {
+        s.validate().errors.iter().any(|e| {
+            let ValidationError::Invalid { field, .. } = e;
+            field == "agent.idle_timeout"
+        })
+    }
+
+    fn spec_with(idle: Option<u64>, max: Option<u64>) -> AgentSpec {
+        let mut s = super::tests::base();
+        s.agent.idle_timeout = idle;
+        s.agent.max_turn_duration = max;
+        s
+    }
+
+    #[test]
+    fn an_idle_timeout_at_or_above_the_turn_cap_is_refused() {
+        // The combination buzz-acp rejects at startup. Without this the spec
+        // validates, hived reconciles it, and the agent crash-loops with the
+        // reason only in `docker logs` — which is how it was found.
+        for (idle, max) in [(900, 600), (600, 600)] {
+            assert!(has_idle_error(&spec_with(Some(idle), Some(max))), "accepted idle={idle} max={max}");
+        }
+    }
+
+    #[test]
+    fn a_sane_pair_and_a_partial_one_are_both_fine() {
+        assert!(!has_idle_error(&spec_with(Some(300), Some(600))));
+        // Only one set: the other takes a default this crate does not own, so
+        // there is nothing to compare against and guessing would reject valid
+        // specs.
+        for (idle, max) in [(Some(900), None), (None, Some(600)), (None, None)] {
+            assert!(!has_idle_error(&spec_with(idle, max)), "rejected {idle:?}/{max:?}");
+        }
     }
 }

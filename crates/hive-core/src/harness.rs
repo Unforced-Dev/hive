@@ -77,6 +77,36 @@ pub struct HarnessDef {
     /// in precedence order. These are what the broker mints; they are never
     /// written into a spec.
     pub credential_env: &'static [&'static str],
+    /// Where this harness reads a *file*-shaped credential, when it has one.
+    ///
+    /// Subscription auth is the default way people use these tools, and for
+    /// several of them it is a JSON blob on disk rather than a key in the
+    /// environment — codex writes `auth.json`, and an API key is the fallback,
+    /// not the norm. A harness whose credential can only be an env var leaves
+    /// this `None`.
+    ///
+    /// Absolute, and under the state volume: a credential written anywhere else
+    /// is destroyed on the next container recreate, after which the agent
+    /// silently reverts to unauthenticated.
+    pub credential_file: Option<&'static str>,
+    /// The harness OWNS that file and rewrites it — so a copy taken from one
+    /// machine cannot be injected into another.
+    ///
+    /// grok is the case this exists for. Its access token lasts hours, and its
+    /// refresh token rotates on use: whichever grok refreshes first invalidates
+    /// every other copy. Injecting a snapshot therefore fails in the least
+    /// helpful way available — grok reads the stale file, cannot refresh it,
+    /// and DELETES it, leaving a container that is unauthenticated while its
+    /// spec says a credential was delivered.
+    ///
+    /// Observed, not assumed: the file was present at 1733 bytes immediately
+    /// after create and gone once grok started, with the stored token 24
+    /// minutes past `expires_at`.
+    ///
+    /// Such a harness is logged in INSIDE its own environment, once per
+    /// environment, and keeps its credential in the state volume where it
+    /// survives recreates.
+    pub credential_file_rotates: bool,
     pub model_syntax: ModelSyntax,
     /// Set when the harness is deliberately absent from the image.
     pub unsupported: Option<Unsupported>,
@@ -115,6 +145,8 @@ pub const CATALOG: &[HarnessDef] = &[
         // switches a subscription agent to metered API billing — the image
         // refuses to set it at all, and spec validation bans it.
         credential_env: &["CLAUDE_CODE_OAUTH_TOKEN"],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Bare,
         unsupported: None,
         note: "Subscription auth via CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`.",
@@ -126,6 +158,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &[],
         requires: &["codex-acp", "codex"],
         credential_env: &["CODEX_API_KEY", "OPENAI_API_KEY"],
+        credential_file: Some("/home/agent/state/codex/auth.json"),
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Bracketed,
         unsupported: None,
         note: "Subscription auth also works by injecting ~/.codex/auth.json into CODEX_HOME \
@@ -139,6 +173,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["acp"],
         requires: &["goose"],
         credential_env: &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOSE_PROVIDER"],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
         note: "No subscription path. Can target any OpenAI-compatible endpoint, which makes it \
@@ -160,11 +196,15 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["agent", "--always-approve", "stdio"],
         requires: &["grok"],
         credential_env: &["XAI_API_KEY"],
+        credential_file: Some("/home/agent/state/grok/auth.json"),
+        credential_file_rotates: true,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
-        note: "First-party xAI. Starts and speaks JSON-RPC with no credentials present; auth is \
-               only needed for an actual turn. GROK_HOME must stay a shared read-only install \
-               path — pointed at per-agent state, every agent re-bootstraps 127 MB on first run.",
+        note: "First-party xAI. GROK_HOME is both install dir and state dir, and grok WRITES to it \
+               — sessions, settings, and auth.json, which it reads from there rather than from \
+               ~/.grok. Read-only, session/new fails FS_PERMISSION_DENIED while separately \
+               reporting no credentials. The image points it at per-agent state and symlinks the \
+               shared 127 MB binary in.",
     },
     HarnessDef {
         id: "opencode",
@@ -173,6 +213,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["acp"],
         requires: &["opencode"],
         credential_env: &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
         note: "Multi-provider; `opencode providers` manages auth interactively.",
@@ -184,6 +226,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["acp"],
         requires: &["kimi"],
         credential_env: &["MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_MODEL_API_KEY"],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
         note: "First-party Moonshot, MIT. Smallest harness in the image at ~40 MB.",
@@ -195,6 +239,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &[],
         requires: &["amp-acp", "amp"],
         credential_env: &["AMP_API_KEY"],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
         note: "amp-acp is a third-party adapter over @ampcode/cli (@sourcegraph/amp is \
@@ -209,6 +255,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["acp"],
         requires: &["omp"],
         credential_env: &["XAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
         note: "Installed from the release binary, NOT npm: the npm package requires Bun, and \
@@ -221,6 +269,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["acp"],
         requires: &["cursor-agent"],
         credential_env: &["CURSOR_API_KEY"],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: None,
         note: "`acp` is a HIDDEN subcommand — absent from --help, but it resolves and is the \
@@ -237,6 +287,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["acp", "--accept-hooks"],
         requires: &["hermes"],
         credential_env: &[],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: Some(Unsupported::NotReproducible),
         note: "Installs non-interactively and works, but clones the default branch with no \
@@ -250,6 +302,8 @@ pub const CATALOG: &[HarnessDef] = &[
         args: &["acp"],
         requires: &["openclaw"],
         credential_env: &[],
+        credential_file: None,
+        credential_file_rotates: false,
         model_syntax: ModelSyntax::Passthrough,
         unsupported: Some(Unsupported::NeedsExternalService),
         note: "`openclaw acp` is a bridge to a running OpenClaw Gateway, not a self-contained \

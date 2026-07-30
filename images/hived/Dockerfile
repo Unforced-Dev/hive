@@ -67,6 +67,19 @@ RUN cargo build --release --locked -p hived --bin hived -p hive-cli --bin hive \
 
 FROM debian:bookworm-slim
 
+# curl, because `hive mcp login` walks an OAuth flow with it, and ca-certificates
+# because every step of that flow is https.
+#
+# This image had neither, so the whole subcommand failed at its first request
+# with `No such file or directory (os error 2)` — a message that names a file
+# and does not name curl. The feature was written and tested against a host
+# build, where curl is simply always there, and had never once run where it
+# actually ships.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl --version | head -1
+
 # hive drives Docker through the CLI rather than the API, so the CLI is a hard
 # runtime dependency. Copied from the official image rather than installed from
 # apt: it is a mostly-static Go binary, and this pins the version instead of

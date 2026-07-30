@@ -181,14 +181,29 @@ pub fn login(
     println!("  authorization server: {}", auth.issuer);
     println!("  resource:             {}", auth.resource);
 
-    // Requested scopes default to everything the resource advertises. Narrowing
-    // is a deliberate act (--scope), because a token that silently lacks write
-    // fails at the first create-note rather than at login.
+    // Default to everything the resource advertises; `--scope ""` sends none.
+    //
+    // Letting the consent screen decide is the better model in principle — it
+    // knows which scopes exist, which this user may hold, and how to ask, while
+    // `scopes_supported` describes what the RESOURCE understands rather than
+    // what the server will grant. Naming scopes from it caps the token at the
+    // published set and cannot reach anything outside it.
+    //
+    // It is not the better DEFAULT, because a server that receives no scope is
+    // free to grant nothing, and Parachute does exactly that: the consent
+    // screen offers no choices and the resulting token is useless. A default
+    // that depends on the server having an opinion fails silently on the ones
+    // that do not.
+    //
+    // So: advertised scopes by default, and `--scope ""` for a server whose
+    // consent screen should own the decision.
     let requested: Vec<String> = match scopes {
         Some(s) => s.split(&[',', ' '][..]).filter(|p| !p.is_empty()).map(String::from).collect(),
         None => auth.scopes_supported.clone(),
     };
-    if !requested.is_empty() {
+    if requested.is_empty() {
+        println!("  scopes:               (none requested — the consent screen decides)");
+    } else {
         println!("  scopes:               {}", requested.join(" "));
     }
 

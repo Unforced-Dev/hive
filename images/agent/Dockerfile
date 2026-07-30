@@ -58,6 +58,50 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       bash git ca-certificates curl bzip2 xz-utils libxcb1 libdbus-1-3 jq \
     && rm -rf /var/lib/apt/lists/*
 
+# --- what an agent is expected to already have ---------------------------------
+# An agent in a container cannot `apt-get install` its way out of a missing tool:
+# it has no root, and anything it did install would be destroyed on the next
+# recreate. So the image has to anticipate, and the failure of not doing so is
+# quiet — a harness that shells out to `rg` and silently falls back to something
+# slower, a build that dies on a native npm module, `git log` with no pager.
+#
+# The list is "what a competent person would expect on a working machine", not
+# "everything imaginable". Language toolchains beyond node and python are
+# deliberately absent: they are large, and an agent that needs Go or Rust wants
+# a specific version rather than whatever Debian ships.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ripgrep fd-find \
+      python3 python3-pip python3-venv \
+      build-essential pkg-config \
+      openssh-client rsync \
+      less vim-tiny nano tree file \
+      unzip zip \
+      sqlite3 \
+      ca-certificates \
+ && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+ && ln -sf /usr/bin/vim.tiny /usr/local/bin/vim \
+ && rm -rf /var/lib/apt/lists/* \
+ # Assert rather than hope: a base image that stops shipping one of these
+ # should fail the build, not produce agents that quietly cannot search.
+ && for t in rg fd python3 pip3 make gcc ssh rsync less tree unzip sqlite3; do \
+      command -v "$t" >/dev/null || { echo "missing after install: $t" >&2; exit 1; }; \
+    done
+
+# gh, because reading issues and opening pull requests is ordinary agent work
+# and the alternative is hand-rolled curl against the REST API. From GitHub's
+# own release rather than apt: Debian does not package it, and the tarball is a
+# single static binary.
+ARG GH_VERSION=2.63.2
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) gharch=amd64 ;; arm64) gharch=arm64 ;; *) echo "unknown arch $arch" >&2; exit 1 ;; esac; \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gharch}.tar.gz" \
+      -o /tmp/gh.tgz; \
+    tar -xzf /tmp/gh.tgz -C /tmp; \
+    mv "/tmp/gh_${GH_VERSION}_linux_${gharch}/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_${gharch}"; \
+    gh --version | head -1
+
 # --- THE npm LIFECYCLE-SCRIPT GATE ------------------------------------------
 # node:24-bookworm-slim ships npm 11.16.0, which refuses to run dependency
 # install scripts by default AND STILL EXITS 0 (`strict-allow-scripts` is
@@ -115,16 +159,35 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/goose
 
 # --- grok (Grok Build) — first-party xAI ------------------------------------
-# GROK_HOME is the INSTALL location, not per-agent state. It must stay a shared
-# read-only path: point it into the per-agent volume and every agent
-# re-bootstraps its own 127 MB copy of the binary on first run.
+# GROK_HOME is BOTH the install location and the state directory, and grok needs
+# to WRITE to it: session storage, auth.json, settings. An earlier version of
+# this file pinned it read-only at /opt/grok to stop every agent re-bootstrapping
+# its own 127 MB copy of the binary — which worked, and made grok unusable:
+#
+#   session search bootstrap failed: unable to open database file:
+#     /opt/grok/sessions/session_search.sqlite
+#   No credentials found: no login token and no model api_key/env_key
+#   → session/new fails FS_PERMISSION_DENIED (os error 13)
+#
+# The credential half is the nastier one: with GROK_HOME set, grok reads
+# auth.json from there and NOT from ~/.grok, so a perfectly good login is
+# invisible and the error names a filesystem problem.
+#
+# So the install stays shared at /opt/grok and GROK_HOME points into the
+# per-agent volume, with the binary symlinked in by the entrypoint. Writable
+# state per agent, one 127 MB copy on disk.
 ARG GROK_VERSION=0.2.112
+# Set for the INSTALL only — the postinstall bootstraps the 127 MB binary into
+# whatever GROK_HOME points at, and unset it lands in root's home where the
+# agent user cannot reach it. Overridden to the per-agent path further down;
+# ENV is sequential, so the last one wins at runtime.
 ENV GROK_HOME=/opt/grok
 RUN npm install -g --no-fund --no-audit \
       --allow-scripts=@xai-official/grok \
       "@xai-official/grok@${GROK_VERSION}" \
  && npm cache clean --force \
- && chmod -R a+rX /opt/grok 2>/dev/null || true
+ && chmod -R a+rX /opt/grok 2>/dev/null || true \
+ && test -x /opt/grok/bin/grok
 
 # --- opencode ---------------------------------------------------------------
 ARG OPENCODE_VERSION=1.18.8
@@ -279,7 +342,9 @@ ENV XDG_DATA_HOME=/home/agent/state/data
 # entrypoint creates the targets, because on a FIRST run the volume is empty and
 # a dangling symlink makes the harness's own `mkdir -p` fail with EEXIST.
 ENV AMP_HOME=/home/agent/state/amp
-# GROK_HOME is deliberately NOT redirected here — see the install step.
+# GROK_HOME is per-agent: grok writes sessions there AND reads auth.json from
+# it. The entrypoint symlinks the shared 127 MB binary in.
+ENV GROK_HOME=/home/agent/state/grok
 
 # Create the state root AS THE AGENT USER, before VOLUME.
 #
@@ -289,7 +354,13 @@ ENV AMP_HOME=/home/agent/state/amp
 # thing every harness does is fail: goose panics on "Failed to create session
 # database directory", opencode dies with EACCES on mkdir. Creating the
 # directory here first means the volume inherits agent ownership instead.
-RUN mkdir -p /home/agent/state /home/agent/work \
+# /home/agent/work is deliberately NOT created here. As a real directory in the
+# image it lands on the container's ephemeral layer, and since hive-acp points
+# the client's cwd at it, every recreate would silently delete the agent's work
+# while its sessions and credentials survived on the volume. The entrypoint
+# links it into the state volume instead — and `link_state` will not replace a
+# real directory, so creating one here would defeat it.
+RUN mkdir -p /home/agent/state \
  && test -w /home/agent/state
 
 VOLUME ["/home/agent/state"]

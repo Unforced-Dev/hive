@@ -20,7 +20,18 @@ pub use validate::{ValidationError, ValidationReport};
 /// is never written back here.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentSpec {
-    pub identity: Identity,
+    /// Who the agent is on the relay. Required in `mode = "relay"`, where hive
+    /// runs buzz-acp itself; absent in `mode = "environment"`, where the
+    /// container is a place to run a harness and the identity belongs to
+    /// whatever spawned it.
+    ///
+    /// Optional because an environment genuinely has none — buzz-acp holds the
+    /// key on the host and Buzz strips it from the harness environment before
+    /// spawning, so a pubkey in the spec would be a value nothing reads. Making
+    /// it mandatory meant every generated spec carried four lines of fiction
+    /// that read as configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
     pub harness: Harness,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -165,6 +176,19 @@ pub struct Harness {
     /// container to log in.
     #[serde(default)]
     pub auth: HarnessAuth,
+
+    /// Which broker key holds this harness's credential. Defaults to
+    /// `harness/<id>`.
+    ///
+    /// One key per harness id means every agent on this box shares one
+    /// subscription, which is wrong in both directions: an agent running on
+    /// someone else's tokens has no way to say so, and a second subscription —
+    /// the obvious move when the first one runs out — cannot be expressed at
+    /// all. Naming the key here makes the credential a per-agent choice, and
+    /// swapping one is `hive secret put` against a different key rather than
+    /// overwriting the credential every other agent is using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -183,8 +207,36 @@ pub enum HarnessAuth {
     Interactive,
 }
 
+/// Whether an agent container connects to the relay itself, or is only a
+/// sandbox something else drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    /// The container runs `buzz-acp` and holds the relay connection. Default,
+    /// and the only mode that survives the desktop being closed.
+    #[default]
+    Relay,
+    /// The container is a sandbox only; `hive-acp` execs the harness in from
+    /// outside. Nothing in here talks to a relay.
+    Environment,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentConfig {
+    /// Whether this container holds its own relay connection.
+    ///
+    /// Default `relay`: the container runs `buzz-acp`, connects to the relay
+    /// itself, and outlives any desktop. That is the standalone agent.
+    ///
+    /// `environment` is for the other topology — hive occupying Buzz's
+    /// *harness* seam rather than its backend seam. There `buzz-acp` runs
+    /// wherever the desktop runs and holds the identity, and `hive-acp` execs
+    /// the harness into this container from outside. The container is then only
+    /// a sandbox and must NOT run `buzz-acp` itself: it has no nsec, so it
+    /// would crash-loop, and `docker exec` into a crash-looping container
+    /// fails intermittently rather than cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AgentMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     /// Harness-specific model id. NOT portable between harnesses: Claude
@@ -232,6 +284,10 @@ fn default_true() -> bool {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            // None, not Some(Relay): an explicit value here would be written
+            // back out on every serialize, putting `mode = "relay"` into specs
+            // that never asked for it.
+            mode: None,
             system_prompt: None,
             model: None,
             respond_to: None,

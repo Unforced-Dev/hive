@@ -59,15 +59,28 @@ pub fn resolve_harness(spec: &AgentSpec) -> Result<&'static HarnessDef, PlanErro
 /// cannot work.
 pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, PlanError> {
     let h = resolve_harness(spec)?;
-    let mut reqs = vec![Requirement {
-        // Not derived from the agent name: several specs may share one identity
-        // across relays, and the secret key must live in exactly one place.
-        key: CredentialKey::new(spec.identity.credential_key(agent)),
-        // The agent's Nostr identity. Necessarily an env var: buzz-acp reads
-        // BUZZ_PRIVATE_KEY at startup and there is no file or helper form.
-        delivery: Delivery::Env { var: "BUZZ_PRIVATE_KEY".into() },
-        purpose: "the agent's Nostr identity; without it it cannot join the relay at all",
-    }];
+    let mut reqs = Vec::new();
+
+    // The Nostr identity, but ONLY when this container connects to a relay.
+    //
+    // An environment container never starts buzz-acp — the desktop's does, and
+    // it holds the identity. Demanding an nsec here would hold the agent
+    // forever waiting for a key that by design lives somewhere else, and the
+    // hold reads as a missing credential rather than as a mode mismatch.
+    if spec.agent.mode.unwrap_or_default() == hive_spec::AgentMode::Relay
+        && let Some(identity) = &spec.identity
+    {
+        reqs.push(Requirement {
+            // Not derived from the agent name: several specs may share one
+            // identity across relays, and the secret key must live in exactly
+            // one place.
+            key: CredentialKey::new(identity.credential_key(agent)),
+            // Necessarily an env var: buzz-acp reads BUZZ_PRIVATE_KEY at
+            // startup and there is no file or helper form.
+            delivery: Delivery::Env { var: "BUZZ_PRIVATE_KEY".into() },
+            purpose: "the agent's Nostr identity; without it it cannot join the relay at all",
+        });
+    }
 
     // The model-provider credential, but only when it is actually an env var.
     // Codex subscription auth is a file with no env form, and an interactively
@@ -78,8 +91,16 @@ pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, P
     if spec.harness.auth == hive_spec::HarnessAuth::Broker
         && let Some(var) = h.credential_env.first()
     {
+        // The spec may point at a different key: a second subscription, or
+        // someone else's tokens. Defaults to `harness/<id>` so the common case
+        // stays untyped.
+        let key = spec
+            .harness
+            .credential
+            .clone()
+            .unwrap_or_else(|| format!("harness/{}", h.id));
         reqs.push(Requirement {
-            key: CredentialKey::new(format!("harness/{}", h.id)),
+            key: CredentialKey::new(key),
             delivery: Delivery::Env { var: (*var).to_string() },
             purpose: "the model provider credential; without it the agent joins and cannot think",
         });
@@ -131,27 +152,37 @@ pub fn mcp_token_env(server: &str) -> String {
 pub fn environment(spec: &AgentSpec, h: &HarnessDef, agent: &str) -> Result<BTreeMap<String, String>, PlanError> {
     let mut env = BTreeMap::new();
 
-    env.insert("BUZZ_RELAY_URL".into(), spec.identity.relay_url.clone());
+    // An environment has no identity: buzz-acp runs outside the container and
+    // holds it. Setting a relay url or an owner here would be describing a
+    // connection this container never makes.
+    if let Some(identity) = &spec.identity {
+        env.insert("BUZZ_RELAY_URL".into(), identity.relay_url.clone());
 
-    // Owner attestation. NIP-OA is preferred: the agent then derives relay
-    // access from its owner's membership (NIP-AA virtual membership) instead of
-    // needing its own enrollment.
-    match (&spec.identity.auth_tag, &spec.identity.owner_pubkey) {
-        (Some(tag), _) => {
-            env.insert("BUZZ_AUTH_TAG".into(), tag.clone());
+        // Owner attestation. NIP-OA is preferred: the agent then derives relay
+        // access from its owner's membership (NIP-AA virtual membership) instead
+        // of needing its own enrollment.
+        match (&identity.auth_tag, &identity.owner_pubkey) {
+            (Some(tag), _) => {
+                env.insert("BUZZ_AUTH_TAG".into(), tag.clone());
+            }
+            (None, Some(owner)) => {
+                env.insert("BUZZ_ACP_AGENT_OWNER".into(), owner.clone());
+            }
+            // Without either, the harness starts, connects, and responds to
+            // nobody. It looks completely healthy. Validation rejects this too;
+            // this is the second gate, because the cost of missing it is hours.
+            (None, None) => return Err(PlanError::NoOwner(agent.to_string())),
         }
-        (None, Some(owner)) => {
-            env.insert("BUZZ_ACP_AGENT_OWNER".into(), owner.clone());
-        }
-        // Without either, the harness starts, connects, and responds to nobody.
-        // It looks completely healthy. Validation rejects this too; this is the
-        // second gate, because the cost of missing it is hours.
-        (None, None) => return Err(PlanError::NoOwner(agent.to_string())),
     }
 
     env.insert("BUZZ_ACP_AGENT_COMMAND".into(), h.command.to_string());
     if !h.args.is_empty() {
-        env.insert("BUZZ_ACP_AGENT_ARGS".into(), h.args.join(" "));
+        // COMMA, not space: buzz-acp parses this field with
+        // `value_delimiter = ','`. Joined with spaces, grok's
+        // `agent --always-approve stdio` arrives as a single argument and the
+        // harness refuses to start — latent until a multi-arg harness runs in
+        // relay mode.
+        env.insert("BUZZ_ACP_AGENT_ARGS".into(), h.args.join(","));
     }
 
     let cfg = &spec.agent;
@@ -287,10 +318,21 @@ pub fn container_plan(
     Ok(ContainerPlan {
         name: Names::container(agent),
         image: image.to_string(),
-        // The container runs buzz-acp, which spawns the harness named by
-        // BUZZ_ACP_AGENT_COMMAND. The image's ENTRYPOINT wraps this to create
-        // state directories first.
-        command: vec!["buzz-acp".into()],
+        // In relay mode the container runs buzz-acp, which spawns the harness
+        // named by BUZZ_ACP_AGENT_COMMAND. In environment mode buzz-acp lives
+        // outside — wherever the desktop is — so the container must not start
+        // one: it has no nsec and would crash-loop, and `docker exec` into a
+        // crash-looping container fails intermittently rather than cleanly. It
+        // idles instead, and hive-acp execs the harness in.
+        //
+        // Either way the image's ENTRYPOINT runs first and creates the state
+        // directories, which an environment container needs just as much.
+        command: match spec.agent.mode.unwrap_or_default() {
+            hive_spec::AgentMode::Relay => vec!["buzz-acp".into()],
+            hive_spec::AgentMode::Environment => {
+                vec!["sh".into(), "-c".into(), "exec sleep infinity".into()]
+            }
+        },
         env,
         labels: labels_for(agent, &spec.hash(), h.id),
         network: Names::network(agent),
@@ -342,6 +384,46 @@ id = "claude"
     }
 
     #[test]
+    fn a_relay_agent_runs_buzz_acp_and_an_environment_agent_does_not() {
+        // The two topologies need different containers. In relay mode buzz-acp
+        // lives inside and holds the identity. In environment mode it lives
+        // wherever the desktop is, and hive-acp execs the harness in from
+        // outside — so a container that started its own buzz-acp would have no
+        // nsec, crash-loop, and make `docker exec` fail intermittently rather
+        // than cleanly.
+        let relay = container_plan(
+            &spec_toml(""),
+            "alice",
+            "hive-agent:latest",
+            Default::default(),
+            &Default::default(),
+            None,
+        )
+        .expect("relay plan");
+        assert_eq!(relay.command, vec!["buzz-acp".to_string()]);
+
+        let env_mode = container_plan(
+            &spec_toml("\n[agent]\nmode = \"environment\"\n"),
+            "alice",
+            "hive-agent:latest",
+            Default::default(),
+            &Default::default(),
+            None,
+        )
+        .expect("environment plan");
+        assert!(
+            !env_mode.command.iter().any(|c| c.contains("buzz-acp")),
+            "environment containers must not start buzz-acp: {:?}",
+            env_mode.command
+        );
+        assert!(
+            env_mode.command.iter().any(|c| c.contains("sleep")),
+            "environment containers must stay up so hive-acp can exec in: {:?}",
+            env_mode.command
+        );
+    }
+
+    #[test]
     fn observer_is_turned_on_explicitly_because_the_harness_defaults_it_off() {
         // BUZZ_ACP_RELAY_OBSERVER has default_value_t = false upstream. A
         // container has no stdio to observe, so without this the agent works
@@ -381,7 +463,7 @@ id = "claude"
         // NIP-OA lets the agent derive relay access from its owner's membership
         // rather than needing its own enrollment.
         let mut s = spec_toml("");
-        s.identity.auth_tag = Some("[\"auth\",\"owner\",\"cond\",\"sig\"]".into());
+        s.identity.as_mut().unwrap().auth_tag = Some("[\"auth\",\"owner\",\"cond\",\"sig\"]".into());
         let h = resolve_harness(&s).unwrap();
         let env = environment(&s, h, "alice").unwrap();
         assert!(env.contains_key("BUZZ_AUTH_TAG"));
@@ -391,8 +473,8 @@ id = "claude"
     #[test]
     fn an_agent_with_no_owner_is_refused_rather_than_silently_idle() {
         let mut s = spec_toml("");
-        s.identity.owner_pubkey = None;
-        s.identity.auth_tag = None;
+        s.identity.as_mut().unwrap().owner_pubkey = None;
+        s.identity.as_mut().unwrap().auth_tag = None;
         let h = harness::lookup("claude").unwrap();
         assert!(matches!(environment(&s, h, "alice"), Err(PlanError::NoOwner(_))));
     }
@@ -422,8 +504,8 @@ id = "claude"
         // up stored twice, where one copy goes stale on rotation.
         let mut home = spec_toml("");
         let mut other = spec_toml("");
-        other.identity.relay_url = "wss://other.example".into();
-        other.identity.credential = Some("nsec/uni".into());
+        other.identity.as_mut().unwrap().relay_url = "wss://other.example".into();
+        other.identity.as_mut().unwrap().credential = Some("nsec/uni".into());
 
         // Different agent names, because they are different containers.
         let a = requirements(&home, "uni").unwrap();
@@ -436,11 +518,49 @@ id = "claude"
         assert_eq!(key_of(&b), "nsec/uni", "the second relay must reuse the same key");
 
         // ...and they are still separate containers with separate state.
-        home.identity.relay_url = "wss://home.example".into();
+        home.identity.as_mut().unwrap().relay_url = "wss://home.example".into();
         assert_ne!(
             crate::backend::Names::volume("uni"),
             crate::backend::Names::volume("uni-other")
         );
+    }
+
+    #[test]
+    fn an_agent_can_name_its_own_harness_credential() {
+        // Two agents, two subscriptions. Without this every agent on the box
+        // shares one key, so a second subscription cannot be expressed and an
+        // agent running on someone else's tokens cannot say so — and swapping
+        // one means overwriting the credential every other agent is using.
+        let mut s = spec_toml("");
+        s.harness.id = Some("claude".into());
+
+        let default = requirements(&s, "a").unwrap();
+        assert!(default.iter().any(|r| r.key.as_str() == "harness/claude"));
+
+        s.harness.credential = Some("harness/claude-second".into());
+        let named = requirements(&s, "a").unwrap();
+        assert!(
+            named.iter().any(|r| r.key.as_str() == "harness/claude-second"),
+            "the spec's key was ignored"
+        );
+        assert!(
+            !named.iter().any(|r| r.key.as_str() == "harness/claude"),
+            "still demands the default key, so the agent needs both"
+        );
+    }
+
+    #[test]
+    fn a_named_credential_still_respects_non_broker_auth() {
+        // Naming a key must not resurrect the demand that `auth` just removed:
+        // an interactively logged-in harness holds its credential in the state
+        // volume, and hive never sees it whatever the key is called.
+        let mut s = spec_toml("");
+        s.harness.id = Some("claude".into());
+        s.harness.credential = Some("harness/claude-second".into());
+        s.harness.auth = hive_spec::HarnessAuth::Interactive;
+
+        let reqs = requirements(&s, "a").unwrap();
+        assert!(!reqs.iter().any(|r| r.key.as_str().starts_with("harness/")));
     }
 
     #[test]
