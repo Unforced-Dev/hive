@@ -195,15 +195,27 @@ pub fn standard_volumes(agent: &str) -> Vec<VolumeMount> {
 
 /// The broker socket mount, when an agent has broker-delivered credentials.
 ///
-/// A per-agent socket path rather than one shared socket: the broker identifies
-/// the caller by which socket it arrived on. There is no other identity
-/// available — a unix socket peer credential gives uid 1001 for every agent
-/// container alike, so a shared socket could not tell them apart, and any agent
-/// could ask for any agent's secrets.
+/// A per-agent DIRECTORY containing one socket, rather than the socket file
+/// itself. Two properties have to hold at once and only this shape gives both.
+///
+/// **Identity.** The broker knows the caller by which socket it arrived on.
+/// There is nothing else: a unix peer credential reports uid 1001 for every
+/// agent container alike, so one shared socket could not tell them apart and any
+/// agent could ask for any agent's secrets. Hence per-agent, and hence NOT a
+/// mount of the whole socket directory — that would hand every agent every other
+/// agent's socket.
+///
+/// **Survival.** Bind-mounting the socket FILE pins an inode. The daemon
+/// recreates its sockets on startup, so every restart left running containers
+/// bound to a deleted inode: the file was still there, nothing was listening,
+/// and the agent got `Connection refused` while looking otherwise healthy. Its
+/// MCP servers simply stopped working, with nothing logged on either side —
+/// found only when an agent said it could not reach the vault. Mounting the
+/// directory keeps the mount valid across socket recreation.
 pub fn broker_mount(agent: &str, host_socket_dir: &PathBuf) -> VolumeMount {
     VolumeMount {
-        source: host_socket_dir.join(format!("{agent}.sock")).display().to_string(),
-        target: "/run/hive/broker.sock".into(),
+        source: host_socket_dir.join(agent).display().to_string(),
+        target: "/run/hive".into(),
         read_only: false, // a socket needs write to connect
     }
 }
@@ -235,5 +247,26 @@ mod tests {
         let dir = PathBuf::from("/run/hive");
         assert_ne!(broker_mount("alice", &dir).source, broker_mount("bob", &dir).source);
         assert_eq!(broker_mount("alice", &dir).target, broker_mount("bob", &dir).target);
+    }
+
+    #[test]
+    fn an_agent_never_mounts_the_shared_socket_directory() {
+        // The failure this guards against is silent and total: every agent
+        // would see every other agent's socket, and the broker's only means of
+        // telling callers apart is which socket they arrived on.
+        let dir = PathBuf::from("/run/hive");
+        let m = broker_mount("alice", &dir);
+        assert_ne!(m.source, dir.display().to_string(), "mounted the shared directory");
+        assert!(m.source.ends_with("/alice"), "{}", m.source);
+    }
+
+    #[test]
+    fn the_mount_is_a_directory_so_it_survives_socket_recreation() {
+        // Bind-mounting the socket FILE pins an inode; the daemon recreates its
+        // sockets on startup, and a running container was then bound to a
+        // deleted one — `Connection refused`, nothing listening, nothing logged.
+        let m = broker_mount("alice", &PathBuf::from("/run/hive"));
+        assert!(!m.source.ends_with(".sock"), "still mounting the socket file: {}", m.source);
+        assert_eq!(m.target, "/run/hive");
     }
 }

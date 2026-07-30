@@ -62,6 +62,14 @@ enum Command {
         /// Agent name. The spec is written as `<name>.toml`.
         name: String,
     },
+    /// Environments: what exists, what is running, and what each one holds.
+    ///
+    /// The view that was missing. Buzz knows about agents, the supervisor knows
+    /// about processes, and the daemon knows about containers — but nothing
+    /// joined them, so "what do I actually have" needed three commands and a
+    /// mental merge.
+    #[command(subcommand)]
+    Env(EnvCmd),
     /// Which harnesses this build can run, and which it refuses.
     Harnesses,
     /// What the daemon currently believes.
@@ -128,6 +136,14 @@ enum Command {
         #[arg(long)]
         published: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum EnvCmd {
+    /// One line per environment.
+    List,
+    /// Everything about one environment, including what it is missing.
+    Show { name: String },
 }
 
 #[derive(Subcommand)]
@@ -202,6 +218,10 @@ fn main() -> Result<()> {
     match &cli.command {
         Command::Validate { file } => validate(file),
         Command::SpecPut { name } => spec_put(&cli.spec_dir, name),
+        Command::Env(c) => match c {
+            EnvCmd::List => env_list(&cli.spec_dir, &cli.secrets_dir),
+            EnvCmd::Show { name } => env_show(&cli.spec_dir, &cli.secrets_dir, name),
+        },
         Command::Harnesses => harnesses(),
         Command::Status => status(&cli.control_socket),
         Command::Ps => ps(),
@@ -374,6 +394,169 @@ fn status(socket: &PathBuf) -> Result<()> {
     let resp = control(socket, r#"{"op":"status"}"#)?;
     let v: serde_json::Value = serde_json::from_str(&resp).context("parsing daemon response")?;
     println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+/// Every environment the daemon would reconcile, newest information first.
+///
+/// Reads the spec directory rather than asking the daemon: a spec that hived
+/// has not picked up yet, or is holding for a missing credential, is exactly
+/// what someone running this wants to see.
+fn environments(spec_dir: &std::path::Path) -> Vec<(String, AgentSpec)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(spec_dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        if let Ok(spec) = AgentSpec::from_toml(&text) {
+            out.push((name.to_string(), spec));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Credential keys the broker holds. Names only — values are never read here.
+fn held_credentials(secrets_dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(secrets_dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n != "audit.jsonl" && !n.starts_with('.'))
+        // The broker stores `mcp/parachute` as `mcp__parachute`.
+        .map(|n| n.replace("__", "/"))
+        .collect()
+}
+
+fn container_state(agent: &str) -> &'static str {
+    let Ok(backend) = DockerBackend::discover() else { return "?" };
+    match backend.list() {
+        Ok(list) => match list.iter().find(|c| c.agent == agent) {
+            Some(c) if c.running => "running",
+            Some(_) => "stopped",
+            None => "none",
+        },
+        Err(_) => "?",
+    }
+}
+
+fn env_list(spec_dir: &std::path::Path, secrets_dir: &std::path::Path) -> Result<()> {
+    let envs = environments(spec_dir);
+    if envs.is_empty() {
+        println!("no environments in {}", spec_dir.display());
+        println!("one is created when an agent is deployed, or with `hive spec-put <name>`.");
+        return Ok(());
+    }
+    let held = held_credentials(secrets_dir);
+    println!("{:<22} {:<9} {:<9} {:<7} {}", "NAME", "HARNESS", "STATE", "MCP", "NEEDS");
+    for (name, spec) in &envs {
+        let harness = spec
+            .harness
+            .id
+            .clone()
+            .or_else(|| spec.harness.command.clone())
+            .unwrap_or_else(|| "-".into());
+        // What it is missing matters more than what it has: an environment
+        // holding every credential is unremarkable, and one missing a single
+        // key is an agent that will never start.
+        let missing: Vec<String> = agent::requirements(spec, name)
+            .map(|reqs| {
+                reqs.iter()
+                    .map(|r| r.key.as_str().to_string())
+                    .filter(|k| !held.iter().any(|h| h == k))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let needs = if missing.is_empty() { "-".to_string() } else { missing.join(",") };
+        println!(
+            "{:<22} {:<9} {:<9} {:<7} {}",
+            name,
+            harness,
+            container_state(name),
+            spec.mcp.len(),
+            needs
+        );
+    }
+    Ok(())
+}
+
+fn env_show(spec_dir: &std::path::Path, secrets_dir: &std::path::Path, name: &str) -> Result<()> {
+    let path = spec_dir.join(format!("{name}.toml"));
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("no environment named {name} in {}", spec_dir.display()))?;
+    let spec = AgentSpec::from_toml(&text).context("parsing spec")?;
+    let held = held_credentials(secrets_dir);
+
+    println!("{name}");
+    println!("  container   hive-{name} ({})", container_state(name));
+    println!("  volume      hive-{name}-state");
+    match agent::resolve_harness(&spec) {
+        Ok(h) => println!("  harness     {} ({})", h.id, h.label),
+        Err(e) => println!("  harness     ERROR: {e}"),
+    }
+    println!(
+        "  mode        {}",
+        match spec.agent.mode.unwrap_or_default() {
+            hive_spec::AgentMode::Relay => "relay — this container runs buzz-acp itself",
+            hive_spec::AgentMode::Environment =>
+                "environment — buzz-acp runs outside and holds the identity",
+        }
+    );
+
+    println!("\n  mcp servers");
+    if spec.mcp.is_empty() {
+        println!("    (none) — add with `hive mcp add <n> --url <url> --agent {name}`");
+    }
+    for m in &spec.mcp {
+        let cred = m.credential.clone().unwrap_or_else(|| "-".into());
+        let ok = m.credential.as_ref().is_none_or(|c| held.iter().any(|h| h == c));
+        println!(
+            "    {:<16} {}  [{}{}]",
+            m.name,
+            m.url.clone().unwrap_or_default(),
+            cred,
+            if ok { "" } else { " MISSING" }
+        );
+    }
+
+    println!("\n  credentials");
+    match agent::requirements(&spec, name) {
+        Ok(reqs) => {
+            for r in reqs {
+                let key = r.key.as_str();
+                let present = held.iter().any(|h| h == key);
+                println!(
+                    "    {:<24} {:<9} {}",
+                    key,
+                    if present { "present" } else { "MISSING" },
+                    match &r.delivery {
+                        hive_core::credential::Delivery::Env { var } =>
+                            format!("env {var}"),
+                        hive_core::credential::Delivery::File { path, .. } =>
+                            format!("file {}", path.display()),
+                        hive_core::credential::Delivery::Broker { .. } =>
+                            "broker socket".to_string(),
+                    }
+                );
+            }
+        }
+        Err(e) => println!("    ERROR: {e}"),
+    }
+
+    let report = spec.validate();
+    if !report.warnings.is_empty() || !report.errors.is_empty() {
+        println!();
+        for w in &report.warnings {
+            println!("  warning: {w}");
+        }
+        for e in &report.errors {
+            println!("  error:   {e}");
+        }
+    }
     Ok(())
 }
 
