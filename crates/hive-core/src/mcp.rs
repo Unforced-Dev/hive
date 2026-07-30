@@ -56,6 +56,11 @@ pub enum Auth {
     ///   - must exit 0 AND write to stdout, or the connection fails
     ///   - receives `CLAUDE_CODE_MCP_SERVER_NAME` and `CLAUDE_CODE_MCP_SERVER_URL`
     ///     in its environment, so ONE helper serves every server
+    ///   - stdout must be a FLAT JSON object of string values — the headers
+    ///     themselves. Anything else is discarded in full, with no error: the
+    ///     connection goes out unauthenticated, 401s, and the server is then
+    ///     recorded as needing interactive OAuth, which is unreachable in a
+    ///     container and points the diagnosis at the credential instead.
     Helper { program: String },
     /// The config names an ENVIRONMENT VARIABLE holding the token, rather than
     /// embedding the token itself. Codex's `bearer_token_env_var`. Weaker than a
@@ -138,21 +143,27 @@ fn render_claude(servers: &[McpServer], existing: &str) -> Result<ConfigFile, Mc
     let mcp = entry.as_object_mut().expect("checked above");
 
     for s in servers {
-        let mut e = serde_json::Map::new();
-        match &s.transport {
-            Transport::Http { url } => {
-                // `type` is REQUIRED alongside `url`. Without it the CLI drops
-                // the entry SILENTLY: no warning, no error, the tool is simply
-                // absent and the agent behaves as though it was never configured.
-                e.insert("type".into(), "http".into());
-                e.insert("url".into(), url.clone().into());
-            }
-            Transport::Stdio { command, args } => {
-                e.insert("type".into(), "stdio".into());
-                e.insert("command".into(), command.clone().into());
-                e.insert("args".into(), serde_json::json!(args));
-            }
+        // An HTTP server must not be defined here at all: hive-acp hands the
+        // same server, under the same name, to the same harness at
+        // `session/new`. Two definitions under one name do not merge and do not
+        // conflict loudly — the agent simply ends up unable to use the tool.
+        //
+        // REMOVED rather than skipped. Skipping only stops NEW boxes acquiring
+        // the collision; every box that ever ran an older hive keeps the stale
+        // entry, because this file lives in the agent's state volume and
+        // survives redeploys, image upgrades and container recreation. A fix
+        // that leaves existing installs broken is not a fix.
+        if matches!(s.transport, Transport::Http { .. }) {
+            mcp.remove(s.name.as_str());
+            continue;
         }
+        let Transport::Stdio { command, args } = &s.transport else {
+            continue; // pruned above
+        };
+        let mut e = serde_json::Map::new();
+        e.insert("type".into(), "stdio".into());
+        e.insert("command".into(), command.clone().into());
+        e.insert("args".into(), serde_json::json!(args));
         match &s.auth {
             Auth::None => {}
             Auth::Helper { program } => {
@@ -275,6 +286,14 @@ mod tests {
     use super::*;
     use crate::harness::lookup;
 
+    fn local_stdio() -> McpServer {
+        McpServer {
+            name: "local".into(),
+            transport: Transport::Stdio { command: "some-server".into(), args: vec![] },
+            auth: Auth::None,
+        }
+    }
+
     fn parachute(auth: Auth) -> McpServer {
         McpServer {
             name: "parachute".into(),
@@ -289,6 +308,37 @@ mod tests {
         // the harness to a first-run state: it starts fine and behaves as though
         // it had never been configured, which reads as a model problem.
         let existing = r#"{"userID":"u-123","hasCompletedOnboarding":true}"#;
+        let out = render(lookup("claude").unwrap(), &[local_stdio()], existing).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out.contents).unwrap();
+        assert_eq!(v["userID"], "u-123", "existing keys must survive");
+        assert_eq!(v["hasCompletedOnboarding"], true);
+        assert_eq!(v["mcpServers"]["local"]["command"], "some-server");
+    }
+
+    #[test]
+    fn an_http_server_is_pruned_from_claudes_config_rather_than_written() {
+        // hive-acp hands Claude the same server, under the same name, at
+        // session/new. Two definitions under one name do not merge and do not
+        // conflict loudly: the agent simply cannot use the tool.
+        let out = render(
+            lookup("claude").unwrap(),
+            &[parachute(Auth::Helper { program: "/usr/local/bin/hive-headers".into() }), local_stdio()],
+            "",
+        )
+        .unwrap()
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out.contents).unwrap();
+        assert!(v["mcpServers"].get("parachute").is_none(), "HTTP server written: {}", out.contents);
+        assert!(v["mcpServers"].get("local").is_some(), "stdio server dropped: {}", out.contents);
+    }
+
+    #[test]
+    fn an_http_entry_left_by_an_older_hive_is_removed_from_the_existing_file() {
+        // The case that makes this a fix rather than a mitigation. `.claude.json`
+        // lives in the agent's state volume and survives redeploys, image
+        // upgrades and container recreation, so merely declining to write the
+        // entry would leave every existing box broken forever.
+        let existing = r#"{"mcpServers":{"parachute":{"type":"http","url":"https://vault.example/mcp","headersHelper":"/usr/local/bin/hive-headers"}}}"#;
         let out = render(
             lookup("claude").unwrap(),
             &[parachute(Auth::Helper { program: "/usr/local/bin/hive-headers".into() })],
@@ -297,46 +347,11 @@ mod tests {
         .unwrap()
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out.contents).unwrap();
-        assert_eq!(v["userID"], "u-123", "existing keys must survive");
-        assert_eq!(v["hasCompletedOnboarding"], true);
-        assert_eq!(v["mcpServers"]["parachute"]["url"], "https://vault.example/mcp");
-    }
-
-    #[test]
-    fn claude_http_entries_always_carry_type() {
-        // Without `type`, the CLI drops the entry silently — no warning, no
-        // error, the tool is simply missing at runtime.
-        let out = render(lookup("claude").unwrap(), &[parachute(Auth::None)], "")
-            .unwrap()
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out.contents).unwrap();
-        assert_eq!(v["mcpServers"]["parachute"]["type"], "http");
-    }
-
-    #[test]
-    fn claude_prefers_a_helper_and_writes_no_token_to_disk() {
-        let out = render(
-            lookup("claude").unwrap(),
-            &[parachute(Auth::Helper { program: "/usr/local/bin/hive-headers".into() })],
-            "",
-        )
-        .unwrap()
-        .unwrap();
-        assert!(out.contents.contains("headersHelper"));
-        assert!(!out.contents.contains("Authorization"), "helper path must not embed headers");
-    }
-
-    #[test]
-    fn claude_refuses_env_var_auth_rather_than_emitting_a_placeholder() {
-        // There is no verified env-expansion syntax in Claude Code's mcpServers
-        // headers. An unexpanded ${VAR} surfaces as a 401 at the first tool call.
-        let err = render(
-            lookup("claude").unwrap(),
-            &[parachute(Auth::BearerFromEnv { var: "PARACHUTE_TOKEN".into() })],
-            "",
-        )
-        .unwrap_err();
-        assert!(matches!(err, McpError::UnsupportedAuth { .. }));
+        assert!(
+            v["mcpServers"].get("parachute").is_none(),
+            "the stale entry survived: {}",
+            out.contents
+        );
     }
 
     #[test]
