@@ -112,8 +112,25 @@ fn main() -> Result<()> {
     }
 
     let mut listeners: BTreeSet<String> = BTreeSet::new();
+    let mut last_refresh = std::time::Instant::now() - Duration::from_secs(3600);
 
     loop {
+        // Renew OAuth credentials before they lapse.
+        //
+        // Parachute issues 15-MINUTE access tokens, and the refresh token was
+        // already being STORED with nothing ever using it — so a credential
+        // obtained at login was dead a quarter of an hour later and stayed dead.
+        //
+        // What this does NOT fix: a session holds the token it was given when
+        // its MCP connector was created. Renewing the stored credential helps
+        // the next connection, not a live one. Claude Code re-runs a
+        // headersHelper on 401 and so recovers; anything that took a bare
+        // header once does not.
+        if last_refresh.elapsed() >= Duration::from_secs(REFRESH_EVERY) {
+            last_refresh = std::time::Instant::now();
+            refresh_expiring(&args);
+        }
+
         if let Err(e) = pass(&args, &backend, &broker, &registry, &mut listeners) {
             // A failed pass must not kill the daemon: the next one may succeed,
             // and an exited daemon stops reconciling everything else too.
@@ -123,6 +140,101 @@ fn main() -> Result<()> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(args.interval));
+    }
+}
+
+/// How often to look for credentials worth renewing.
+const REFRESH_EVERY: u64 = 120;
+
+/// Renew when this little is left, so a 15-minute token is replaced with
+/// minutes to spare rather than at the moment something needs it.
+const REFRESH_WHEN_UNDER: i64 = 5 * 60;
+
+/// Seconds until a JWT expires, or `None` if it is not a JWT with an `exp`.
+///
+/// Opaque tokens are left alone: there is nothing to read, and refreshing one
+/// on a timer would spend a rotating refresh token for no reason.
+fn seconds_until_expiry(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    // base64url, no padding.
+    let mut b = payload.replace('-', "+").replace('_', "/");
+    while b.len() % 4 != 0 {
+        b.push('=');
+    }
+    let raw = base64_decode(&b)?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let exp = v.get("exp")?.as_i64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(exp - now)
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = T.iter().position(|&t| t == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Renew every stored OAuth credential that is close to expiring.
+///
+/// Shells out to the `hive` CLI in this same image rather than reimplementing
+/// the flow: it already knows the token endpoint, the client id and the
+/// resource, all stored beside the credential at login. Two implementations of
+/// an OAuth refresh is one more than anybody wants to keep correct.
+fn refresh_expiring(args: &Args) {
+    let specs = match load_specs(&args.spec_dir) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for (agent, spec) in &specs {
+        for m in &spec.mcp {
+            let Some(cred) = &m.credential else { continue };
+            // A refresh token beside the credential is what makes this possible
+            // at all; a hand-placed secret has none and must be left alone.
+            let refresh_path = args.secrets_dir.join(format!("{}+refresh", cred.replace('/', "__")));
+            if !refresh_path.exists() {
+                continue;
+            }
+            let token_path = args.secrets_dir.join(cred.replace('/', "__"));
+            let Ok(tok) = std::fs::read_to_string(&token_path) else { continue };
+            match seconds_until_expiry(tok.trim()) {
+                Some(left) if left > REFRESH_WHEN_UNDER => continue,
+                None => continue,
+                Some(left) => {
+                    tracing::info!(agent = %agent, server = %m.name, seconds_left = left, "renewing");
+                }
+            }
+            let out = std::process::Command::new("hive")
+                .args(["mcp", "refresh", &m.name, "--agent", agent])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    tracing::info!(agent = %agent, server = %m.name, "credential renewed")
+                }
+                Ok(o) => tracing::warn!(
+                    agent = %agent, server = %m.name,
+                    error = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "renewal failed — the agent will lose this server when the token lapses"
+                ),
+                Err(e) => tracing::warn!(agent = %agent, error = %e, "could not run `hive mcp refresh`"),
+            }
+        }
     }
 }
 

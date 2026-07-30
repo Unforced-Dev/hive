@@ -245,7 +245,11 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(untagged)]
 pub enum Response {
-    /// The shape Claude Code expects on stdout.
+    /// The BROKER's envelope — deliberately not the shape Claude Code expects
+    /// on stdout. This one has to distinguish headers from an error; that one
+    /// is the bare header map and has no room for an envelope. `hive-headers`
+    /// converts between them. Emitting this verbatim silently discards every
+    /// header, so the difference is load-bearing rather than cosmetic.
     Headers { headers: std::collections::BTreeMap<String, String> },
     Error { error: String },
 }
@@ -427,8 +431,13 @@ mod tests {
         assert!(!log.contains("alice-secret"), "audit leaked the secret");
     }
 
+    // Named for the broker's own envelope, NOT for Claude Code's stdout
+    // contract. The previous name claimed the latter while asserting the
+    // former, and that gap is exactly where the headers-helper bug lived: the
+    // wrapper was passed through to stdout unchanged, every header was
+    // discarded, and this green test said the shape was right.
     #[test]
-    fn headers_come_back_in_the_shape_claude_code_expects() {
+    fn a_granted_request_returns_the_brokers_headers_envelope() {
         let b = Broker::open(tmpdir("f")).unwrap();
         b.put(&CredentialKey::new("mcp/parachute"), b"tok-123\n").unwrap();
         let servers = ServerKeys::from([("parachute".into(), "mcp/parachute".into())]);
