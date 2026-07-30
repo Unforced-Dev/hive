@@ -58,6 +58,50 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       bash git ca-certificates curl bzip2 xz-utils libxcb1 libdbus-1-3 jq \
     && rm -rf /var/lib/apt/lists/*
 
+# --- what an agent is expected to already have ---------------------------------
+# An agent in a container cannot `apt-get install` its way out of a missing tool:
+# it has no root, and anything it did install would be destroyed on the next
+# recreate. So the image has to anticipate, and the failure of not doing so is
+# quiet — a harness that shells out to `rg` and silently falls back to something
+# slower, a build that dies on a native npm module, `git log` with no pager.
+#
+# The list is "what a competent person would expect on a working machine", not
+# "everything imaginable". Language toolchains beyond node and python are
+# deliberately absent: they are large, and an agent that needs Go or Rust wants
+# a specific version rather than whatever Debian ships.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ripgrep fd-find \
+      python3 python3-pip python3-venv \
+      build-essential pkg-config \
+      openssh-client rsync \
+      less vim-tiny nano tree file \
+      unzip zip \
+      sqlite3 \
+      ca-certificates \
+ && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+ && ln -sf /usr/bin/vim.tiny /usr/local/bin/vim \
+ && rm -rf /var/lib/apt/lists/* \
+ # Assert rather than hope: a base image that stops shipping one of these
+ # should fail the build, not produce agents that quietly cannot search.
+ && for t in rg fd python3 pip3 make gcc ssh rsync less tree unzip sqlite3; do \
+      command -v "$t" >/dev/null || { echo "missing after install: $t" >&2; exit 1; }; \
+    done
+
+# gh, because reading issues and opening pull requests is ordinary agent work
+# and the alternative is hand-rolled curl against the REST API. From GitHub's
+# own release rather than apt: Debian does not package it, and the tarball is a
+# single static binary.
+ARG GH_VERSION=2.63.2
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) gharch=amd64 ;; arm64) gharch=arm64 ;; *) echo "unknown arch $arch" >&2; exit 1 ;; esac; \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gharch}.tar.gz" \
+      -o /tmp/gh.tgz; \
+    tar -xzf /tmp/gh.tgz -C /tmp; \
+    mv "/tmp/gh_${GH_VERSION}_linux_${gharch}/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_${gharch}"; \
+    gh --version | head -1
+
 # --- THE npm LIFECYCLE-SCRIPT GATE ------------------------------------------
 # node:24-bookworm-slim ships npm 11.16.0, which refuses to run dependency
 # install scripts by default AND STILL EXITS 0 (`strict-allow-scripts` is

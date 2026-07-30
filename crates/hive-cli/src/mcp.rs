@@ -181,17 +181,25 @@ pub fn login(
     println!("  authorization server: {}", auth.issuer);
     println!("  resource:             {}", auth.resource);
 
-    // No `--scope` means NO scope parameter — not "everything advertised".
+    // Default to everything the resource advertises; `--scope ""` sends none.
     //
-    // The authorization server's consent screen is what should decide this: it
-    // knows which scopes exist, which this user may have, and how to ask. A
-    // client that names them itself is guessing from
-    // `scopes_supported`, which lists what the RESOURCE understands rather than
-    // what the server is willing to grant — so it silently caps a token at the
-    // published set and cannot obtain anything outside it.
+    // Letting the consent screen decide is the better model in principle — it
+    // knows which scopes exist, which this user may hold, and how to ask, while
+    // `scopes_supported` describes what the RESOURCE understands rather than
+    // what the server will grant. Naming scopes from it caps the token at the
+    // published set and cannot reach anything outside it.
+    //
+    // It is not the better DEFAULT, because a server that receives no scope is
+    // free to grant nothing, and Parachute does exactly that: the consent
+    // screen offers no choices and the resulting token is useless. A default
+    // that depends on the server having an opinion fails silently on the ones
+    // that do not.
+    //
+    // So: advertised scopes by default, and `--scope ""` for a server whose
+    // consent screen should own the decision.
     let requested: Vec<String> = match scopes {
         Some(s) => s.split(&[',', ' '][..]).filter(|p| !p.is_empty()).map(String::from).collect(),
-        None => Vec::new(),
+        None => auth.scopes_supported.clone(),
     };
     if requested.is_empty() {
         println!("  scopes:               (none requested — the consent screen decides)");
