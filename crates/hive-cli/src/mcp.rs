@@ -181,14 +181,21 @@ pub fn login(
     println!("  authorization server: {}", auth.issuer);
     println!("  resource:             {}", auth.resource);
 
-    // Requested scopes default to everything the resource advertises. Narrowing
-    // is a deliberate act (--scope), because a token that silently lacks write
-    // fails at the first create-note rather than at login.
+    // No `--scope` means NO scope parameter — not "everything advertised".
+    //
+    // The authorization server's consent screen is what should decide this: it
+    // knows which scopes exist, which this user may have, and how to ask. A
+    // client that names them itself is guessing from
+    // `scopes_supported`, which lists what the RESOURCE understands rather than
+    // what the server is willing to grant — so it silently caps a token at the
+    // published set and cannot obtain anything outside it.
     let requested: Vec<String> = match scopes {
         Some(s) => s.split(&[',', ' '][..]).filter(|p| !p.is_empty()).map(String::from).collect(),
-        None => auth.scopes_supported.clone(),
+        None => Vec::new(),
     };
-    if !requested.is_empty() {
+    if requested.is_empty() {
+        println!("  scopes:               (none requested — the consent screen decides)");
+    } else {
         println!("  scopes:               {}", requested.join(" "));
     }
 
