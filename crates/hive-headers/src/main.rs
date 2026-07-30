@@ -23,6 +23,13 @@
 //!   environment, so ONE helper serves every server and none of this is
 //!   hardcoded per-server
 //! - re-run automatically on 401/403, so a short-lived token is fine
+//! - **stdout must be a FLAT JSON object whose every value is a string** — the
+//!   headers themselves, not a wrapper around them. The parser rejects the whole
+//!   response on the first non-string value ("must return a JSON object with
+//!   string key-value pairs"), and a rejected response is not an error the user
+//!   ever sees: the connection is simply attempted with NO auth header, 401s,
+//!   and the server is then recorded as needing interactive OAuth. See
+//!   [`flatten`].
 //!
 //! Rust rather than a shell script because the image has no `nc` or `socat`, and
 //! rather than node because a helper on a 10s budget should not depend on a
@@ -89,17 +96,102 @@ fn run() -> Result<String, String> {
         return Err("broker closed the connection without responding".into());
     }
 
+    flatten(line.trim())
+}
+
+/// Turn the broker's `{"headers":{...}}` reply into the flat object Claude Code
+/// requires on stdout.
+///
+/// These are two different wire formats and this function is the seam between
+/// them. Passing the broker's reply through unchanged looks like the careful
+/// choice — one owner for the format, no drift — but it is wrong: the broker's
+/// envelope has to distinguish `headers` from `error`, and Claude Code's stdout
+/// contract has no room for an envelope at all. Emitting the envelope means
+/// emitting `{"headers": {...}}`, whose one value is an object, which trips the
+/// "string key-value pairs" check and discards every header.
+///
+/// The failure that produces is silent and misleading, which is why this is
+/// worth a function and a test rather than a line: no error is surfaced, the
+/// request simply goes out unauthenticated, the 401 sends Claude Code into OAuth
+/// discovery, and the server is recorded as "Needs authentication" — pointing at
+/// the credential, which is valid, rather than at the shape of this output.
+fn flatten(line: &str) -> Result<String, String> {
     let value: serde_json::Value =
-        serde_json::from_str(line.trim()).map_err(|e| format!("malformed response: {e}"))?;
+        serde_json::from_str(line).map_err(|e| format!("malformed response: {e}"))?;
 
     if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
         return Err(err.to_string());
     }
-    // Pass the broker's response through unchanged rather than reconstructing
-    // it. Re-serialising would mean this program and the broker each own half
-    // the wire format, and they would drift.
-    if value.get("headers").is_some() {
-        return Ok(line.trim().to_string());
+
+    let headers = value
+        .get("headers")
+        .and_then(|h| h.as_object())
+        .ok_or_else(|| format!("unexpected response shape: {line}"))?;
+
+    // Check here rather than letting Claude Code reject the batch: it discards
+    // ALL headers on one bad value, and says so only in its own debug log.
+    if let Some((k, v)) = headers.iter().find(|(_, v)| !v.is_string()) {
+        return Err(format!("header {k:?} is {} rather than a string", kind_of(v)));
     }
-    Err(format!("unexpected response shape: {}", line.trim()))
+
+    serde_json::to_string(&serde_json::Value::Object(headers.clone()))
+        .map_err(|e| format!("re-serialising headers: {e}"))
+}
+
+fn kind_of(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_is_the_headers_themselves_not_the_brokers_envelope() {
+        // The regression this file exists to prevent. Emitting the envelope
+        // sends the request out with no Authorization header at all: Claude
+        // Code rejects a response whose values are not strings, and reports
+        // nothing — the server just appears to need OAuth.
+        let out = flatten(r#"{"headers":{"Authorization":"Bearer tok-123"}}"#).unwrap();
+        assert_eq!(out, r#"{"Authorization":"Bearer tok-123"}"#);
+        assert!(!out.contains("\"headers\""), "envelope leaked into stdout: {out}");
+    }
+
+    #[test]
+    fn every_value_must_be_a_string_or_claude_code_drops_all_of_them() {
+        // One non-string value discards the whole set, so catching it here —
+        // where the message names the offending key — beats an unauthenticated
+        // request and a 401 three steps later.
+        let err = flatten(r#"{"headers":{"Authorization":"Bearer x","X-Retry":3}}"#).unwrap_err();
+        assert!(err.contains("X-Retry"), "message should name the key: {err}");
+        assert!(err.contains("number"), "message should say what it was: {err}");
+    }
+
+    #[test]
+    fn a_broker_error_is_reported_as_an_error_not_as_headers() {
+        let err = flatten(r#"{"error":"agent 'bob' is not authorised for 'mcp/x'"}"#).unwrap_err();
+        assert!(err.contains("not authorised"), "got {err}");
+    }
+
+    #[test]
+    fn an_empty_header_set_is_passed_through_rather_than_invented() {
+        // Claude Code treats empty stdout as failure, but `{}` is a valid
+        // object. Deciding here that no headers means an error would override
+        // a broker that legitimately has none to send.
+        assert_eq!(flatten(r#"{"headers":{}}"#).unwrap(), "{}");
+    }
+
+    #[test]
+    fn junk_is_an_error_rather_than_a_panic() {
+        for junk in ["", "{", "null", "[]", r#"{"headers":"nope"}"#, r#"{"other":1}"#] {
+            assert!(flatten(junk).is_err(), "junk {junk:?} was accepted");
+        }
+    }
 }

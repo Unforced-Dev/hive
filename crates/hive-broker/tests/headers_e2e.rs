@@ -93,9 +93,14 @@ fn a_container_gets_mcp_headers_without_the_secret_ever_entering_it() {
         "hive-headers",
     ]);
 
-    assert!(
-        result.contains("Bearer tok-secret-abc"),
-        "helper did not return the credential: {result}"
+    // Assert the EXACT stdout, not that the token appears somewhere in it. A
+    // `contains("Bearer ...")` check passes for the broker's envelope too, and
+    // that is how the envelope reached stdout in the first place: Claude Code
+    // requires a flat object of string values, discards anything else in full,
+    // and reports it nowhere the operator can see.
+    assert_eq!(
+        result, r#"{"Authorization":"Bearer tok-secret-abc"}"#,
+        "helper stdout must be the bare header map"
     );
     // The trailing newline on the stored token must not end up inside the
     // header value.

@@ -146,9 +146,17 @@ fn fetch_headers(container: &str, server: &str) -> Vec<(String, String)> {
         }
     };
     let body = String::from_utf8_lossy(&out.stdout);
-    // The helper prints `{"headers": {name: value, …}}` — the map is NESTED,
-    // not the whole document. Parsing it flat yields zero headers and an MCP
-    // server that 401s, with nothing in the logs to say why.
+    // The helper prints the headers FLAT — `{name: value, …}` — because that is
+    // what Claude Code requires of a headersHelper on stdout, and the helper has
+    // exactly one output format for both callers.
+    //
+    // It used to print the broker's `{"headers": {…}}` envelope, and this
+    // function read the nested map. That worked HERE and silently broke the
+    // other caller: Claude Code discards a helper response whose values are not
+    // strings, so `{"headers": {…}}` produced an unauthenticated request, a 401,
+    // and a server recorded as needing interactive OAuth. Both callers now read
+    // the same flat shape; `hive_headers::flatten` is the only place that knows
+    // about the envelope.
     let parsed: serde_json::Value = match serde_json::from_str(body.trim()) {
         Ok(v) => v,
         Err(e) => {
@@ -156,10 +164,19 @@ fn fetch_headers(container: &str, server: &str) -> Vec<(String, String)> {
             return Vec::new();
         }
     };
-    let Some(map) = parsed.get("headers").and_then(|h| h.as_object()) else {
-        eprintln!("hive-acp: broker response for {server:?} had no headers object");
+    let Some(map) = parsed.as_object() else {
+        eprintln!("hive-acp: broker response for {server:?} was not a JSON object");
         return Vec::new();
     };
+    // Tolerate the old envelope so a new hive-acp against an older agent image
+    // keeps working. Mixed versions are the normal state during a rollout, and
+    // the failure this would otherwise cause is the silent 401 again.
+    if let Some(nested) = map.get("headers").and_then(|h| h.as_object()) {
+        return nested
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+    }
     map.iter()
         .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
         .collect()

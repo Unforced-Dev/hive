@@ -56,6 +56,11 @@ pub enum Auth {
     ///   - must exit 0 AND write to stdout, or the connection fails
     ///   - receives `CLAUDE_CODE_MCP_SERVER_NAME` and `CLAUDE_CODE_MCP_SERVER_URL`
     ///     in its environment, so ONE helper serves every server
+    ///   - stdout must be a FLAT JSON object of string values — the headers
+    ///     themselves. Anything else is discarded in full, with no error: the
+    ///     connection goes out unauthenticated, 401s, and the server is then
+    ///     recorded as needing interactive OAuth, which is unreachable in a
+    ///     container and points the diagnosis at the credential instead.
     Helper { program: String },
     /// The config names an ENVIRONMENT VARIABLE holding the token, rather than
     /// embedding the token itself. Codex's `bearer_token_env_var`. Weaker than a
