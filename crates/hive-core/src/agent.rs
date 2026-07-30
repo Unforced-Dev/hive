@@ -177,7 +177,12 @@ pub fn environment(spec: &AgentSpec, h: &HarnessDef, agent: &str) -> Result<BTre
 
     env.insert("BUZZ_ACP_AGENT_COMMAND".into(), h.command.to_string());
     if !h.args.is_empty() {
-        env.insert("BUZZ_ACP_AGENT_ARGS".into(), h.args.join(" "));
+        // COMMA, not space: buzz-acp parses this field with
+        // `value_delimiter = ','`. Joined with spaces, grok's
+        // `agent --always-approve stdio` arrives as a single argument and the
+        // harness refuses to start — latent until a multi-arg harness runs in
+        // relay mode.
+        env.insert("BUZZ_ACP_AGENT_ARGS".into(), h.args.join(","));
     }
 
     let cfg = &spec.agent;

@@ -569,6 +569,11 @@ fn wait_for_container(container: &str) {
     }
 }
 
+/// The harness to run: `--harness` first, then `HIVE_HARNESS`.
+fn chosen_harness() -> Option<String> {
+    flag("harness").or_else(|| std::env::var("HIVE_HARNESS").ok().filter(|s| !s.is_empty()))
+}
+
 /// Create an environment that does not exist yet, through the daemon.
 ///
 /// Deliberately minimal. An environment is a container to run a harness in:
@@ -581,10 +586,7 @@ fn wait_for_container(container: &str) {
 /// `HIVE_HARNESS` picks the harness when set, so the Buzz entry that named a
 /// harness also gets one configured for it.
 fn create_environment(daemon: &str, name: &str) -> Result<()> {
-    let harness = std::env::var("HIVE_HARNESS")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "claude".to_string());
+    let harness = chosen_harness().unwrap_or_else(|| "claude".to_string());
 
     // Reuse a credential this box already holds, in the FORM the harness reads
     // it.
@@ -598,31 +600,47 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
     // Both key spellings are tried because both are in use: `harness/<id>` is
     // what hive asks for by default, `<id>/auth` is what a file credential gets
     // called when it is stored by hand.
+    let def = CATALOG.iter().find(|h| h.id == harness);
     let held = stored_secrets(daemon);
-    let file_auth = CATALOG
-        .iter()
-        .find(|h| h.id == harness)
-        .and_then(|h| h.credential_file)
-        .and_then(|path| {
-            [format!("harness/{harness}"), format!("{harness}/auth")]
-                .into_iter()
-                .find(|k| held.iter().any(|h| h == k))
-                .map(|key| (key, path))
-        });
 
-    let auth_block = match &file_auth {
-        Some((key, path)) => {
-            eprintln!("hive-acp: {harness} authenticates from a file; using {key}");
-            format!(
-                "auth = \"file\"\n\
-                 \n\
-                 [[file]]\n\
-                 credential = {key:?}\n\
-                 target     = {path:?}\n\
-                 mode       = \"0600\"\n"
-            )
+    // A harness that owns and rewrites its credential file cannot be handed a
+    // copy of somebody else's. Declaring `auth = "file"` for one of those is
+    // worse than declaring nothing: hived injects a snapshot, the harness finds
+    // it stale, cannot refresh a token whose refresh half has already been
+    // rotated elsewhere, and deletes it — leaving an unauthenticated container
+    // whose spec says a credential was delivered.
+    let auth_block = if def.is_some_and(|d| d.credential_file_rotates) {
+        eprintln!(
+            "hive-acp: {harness} manages its own credential and rotates it, so it cannot be \
+             injected. Log in once inside this environment:\n\
+             \x20   hive shell {name} -- grok login --device-auth"
+        );
+        // Not `broker`: hived would hold the agent forever waiting for a key
+        // that by design lives in the state volume, and hold it so hard the
+        // container needed to log in never starts.
+        "auth = \"interactive\"\n".to_string()
+    } else {
+        match def
+            .and_then(|d| d.credential_file)
+            .and_then(|path| {
+                [format!("harness/{harness}"), format!("{harness}/auth")]
+                    .into_iter()
+                    .find(|k| held.iter().any(|h| h == k))
+                    .map(|key| (key, path))
+            }) {
+            Some((key, path)) => {
+                eprintln!("hive-acp: {harness} authenticates from a file; using {key}");
+                format!(
+                    "auth = \"file\"\n\
+                     \n\
+                     [[file]]\n\
+                     credential = {key:?}\n\
+                     target     = {path:?}\n\
+                     mode       = \"0600\"\n"
+                )
+            }
+            None => String::new(),
         }
-        None => String::new(),
     };
 
     let spec = format!(
@@ -666,6 +684,39 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A `--harness <id>` / `--env <name>` flag, if present on the command line.
+///
+/// Reading these from ARGV and not only from the environment is load-bearing on
+/// the deploy path. Buzz layers a harness definition's `env` into a LOCAL spawn
+/// (`readiness.rs`, "definition env"), but `build_deploy_payload` merges only
+/// global, persona and per-agent env — the definition's is dropped. So a
+/// harness entry that carries `HIVE_HARNESS` in `env` works perfectly on this
+/// computer and silently becomes the default harness when deployed to another
+/// one: three agents created as claude, codex and grok all came up as claude,
+/// with nothing in any log to say why.
+///
+/// `agent_args` IS in the deploy payload, so it survives the trip.
+fn flag(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix(&format!("--{name}="))
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
+        }
+        if a == &format!("--{name}")
+            && let Some(v) = args.get(i + 1)
+            && !v.is_empty()
+        {
+            return Some(v.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Which hive environment to run in — `HIVE_ENV`, or the older `HIVE_AGENT`.
 ///
 /// It selects a **container**: image, state volume, network, credentials, MCP
@@ -683,7 +734,7 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
 /// agent offline mid-conversation to make a point is not an improvement.
 fn env_name() -> String {
     let read = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-    if let Some(v) = read("HIVE_ENV") {
+    if let Some(v) = flag("env").or_else(|| read("HIVE_ENV")) {
         return v;
     }
     if let Some(v) = read("HIVE_AGENT") {
@@ -716,7 +767,7 @@ fn env_name() -> String {
     // `session/new` needs that harness's own credentials before it will answer
     // — a single shared probe container would report claude's models for every
     // entry, or fail outright for the ones it cannot authenticate.
-    let scratch = format!("probe-{}", read("HIVE_HARNESS").unwrap_or_else(|| "claude".into()));
+    let scratch = format!("probe-{}", chosen_harness().unwrap_or_else(|| "claude".into()));
     eprintln!(
         "hive-acp: no HIVE_ENV and no supervisor — using the shared discovery environment \
          {scratch:?}. A real agent sets HIVE_ENV, or is deployed by something that names it."
@@ -812,7 +863,7 @@ fn resolve() -> Result<Config> {
     // allowed — refusing would make it impossible to start a container in order
     // to log in — but it is called out below rather than left to surface as an
     // unexplained "authentication required" three steps later.
-    let override_id = std::env::var("HIVE_HARNESS").ok().filter(|s| !s.is_empty());
+    let override_id = chosen_harness();
     let effective_id = override_id.as_deref().or(spec.harness.id.as_deref());
 
     let mut credential_env: Vec<String> = Vec::new();
