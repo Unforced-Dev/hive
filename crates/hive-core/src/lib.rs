@@ -38,9 +38,13 @@ mod image_contract {
     }
 
     /// Binaries the image needs that are not harnesses: the ACP bridge, the CLI
-    /// the agent shells out to in order to post its replies, and the MCP
-    /// credentials helper Claude Code executes per connection.
-    const INFRA_BINARIES: &[&str] = &["buzz-acp", "buzz", "hive-headers"];
+    /// the agent shells out to in order to post its replies, the MCP
+    /// credentials helper Claude Code executes per connection, the stdio↔HTTP
+    /// MCP bridge hive-acp points the harness at, and `curl` — which that
+    /// bridge shells out to for every message, so an image without it fails at
+    /// the first tool call rather than at build time.
+    const INFRA_BINARIES: &[&str] =
+        &["buzz-acp", "buzz", "hive-headers", "hive-mcp-bridge", "curl"];
 
     fn dockerfile_assertion_list() -> Vec<String> {
         let src = image_file("Dockerfile");

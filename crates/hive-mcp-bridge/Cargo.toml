@@ -1,0 +1,9 @@
+[package]
+name = "hive-mcp-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+clap.workspace = true

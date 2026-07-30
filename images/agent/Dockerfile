@@ -33,7 +33,7 @@ RUN cargo build --release --locked -p buzz-acp --bin buzz-acp -p buzz-cli --bin 
     && strip target/release/buzz-acp target/release/buzz
 
 # ---------------------------------------------------------------------------
-# Stage 1b: hive-headers, the in-container MCP credentials helper
+# Stage 1b: the in-container credential helpers
 # ---------------------------------------------------------------------------
 # Built from THIS repo (the main build context). Claude Code runs it once per
 # MCP connection, on a 10-second budget, and reads auth headers from its stdout;
@@ -45,8 +45,8 @@ FROM rust:1.95-bookworm AS hive-builder
 WORKDIR /hive
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-RUN cargo build --release --locked -p hive-headers \
-    && strip target/release/hive-headers
+RUN cargo build --release --locked -p hive-headers -p hive-mcp-bridge \
+    && strip target/release/hive-headers target/release/hive-mcp-bridge
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
@@ -266,6 +266,10 @@ RUN set -eux; \
 COPY --from=builder /build/target/release/buzz-acp /usr/local/bin/buzz-acp
 COPY --from=builder /build/target/release/buzz /usr/local/bin/buzz
 COPY --from=hive-builder /hive/target/release/hive-headers /usr/local/bin/hive-headers
+# The stdio MCP server hive-acp points the harness at. It forwards over HTTP and
+# asks the broker for credentials PER MESSAGE, so a session outliving a
+# 15-minute token is no longer a failure. Needs `curl`, which the runtime has.
+COPY --from=hive-builder /hive/target/release/hive-mcp-bridge /usr/local/bin/hive-mcp-bridge
 
 # ---------------------------------------------------------------------------
 # THE ASSERTION
@@ -281,7 +285,7 @@ COPY --from=hive-builder /hive/target/release/hive-headers /usr/local/bin/hive-h
 # of bug that is otherwise invisible until deploy time.
 RUN set -eux; \
     missing=""; \
-    for b in buzz-acp buzz hive-headers \
+    for b in buzz-acp buzz hive-headers hive-mcp-bridge curl \
              claude-agent-acp claude codex-acp codex goose \
              grok opencode kimi amp-acp amp omp cursor-agent; do \
       command -v "$b" >/dev/null 2>&1 || missing="$missing $b"; \
