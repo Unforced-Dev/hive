@@ -681,33 +681,47 @@ fn create_environment(daemon: &str, name: &str) -> Result<()> {
 /// The old name still works, with a warning rather than a break: it is written
 /// into harness definitions that already exist, and a rename that takes an
 /// agent offline mid-conversation to make a point is not an improvement.
-fn env_name() -> Result<String> {
+fn env_name() -> String {
     let read = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
     if let Some(v) = read("HIVE_ENV") {
-        return Ok(v);
+        return v;
     }
     if let Some(v) = read("HIVE_AGENT") {
         eprintln!(
             "hive-acp: HIVE_AGENT is deprecated, use HIVE_ENV. It selects a container, not an \
              identity — and two Buzz agents sharing one value share one container."
         );
-        return Ok(v);
+        return v;
     }
-    // Fall back to the name the supervisor gave this agent.
+    // The name the supervisor gave this agent.
     //
     // A deployed agent should not need an environment variable set by hand
-    // before it can run at all, and asking for one invites the mistake it was
-    // meant to prevent: reusing a neighbour's value, and silently sharing that
+    // before it can run, and asking for one invites the mistake it was meant to
+    // prevent: reusing a neighbour's value, and silently sharing that
     // container's sessions, skills and credentials. buzz-host publishes its
     // unit name, which is already unique per agent on that machine.
     if let Some(v) = read("BUZZ_HOST_UNIT") {
         eprintln!("hive-acp: HIVE_ENV unset; using this agent's unit name {v:?}");
-        return Ok(v);
+        return v;
     }
-    bail!(
-        "HIVE_ENV is not set. hive-acp runs a harness inside one hive environment; set it \
-         per-agent in Buzz's agent environment variables, so each agent gets its own container."
-    )
+
+    // Nothing has named this agent, which means it does not exist yet: the
+    // desktop is asking a harness what models it supports while the user is
+    // still filling in the dialog. Failing here leaves the model list empty
+    // with no way to fill it — there is nothing to set HIVE_ENV *to* before the
+    // agent exists, and pinning one in the harness definition is exactly what
+    // put every agent in a single shared container in the first place.
+    //
+    // So discovery gets a scratch environment. One PER HARNESS, because
+    // `session/new` needs that harness's own credentials before it will answer
+    // — a single shared probe container would report claude's models for every
+    // entry, or fail outright for the ones it cannot authenticate.
+    let scratch = format!("probe-{}", read("HIVE_HARNESS").unwrap_or_else(|| "claude".into()));
+    eprintln!(
+        "hive-acp: no HIVE_ENV and no supervisor — using the shared discovery environment \
+         {scratch:?}. A real agent sets HIVE_ENV, or is deployed by something that names it."
+    );
+    scratch
 }
 
 /// Resolve everything from the environment name plus its spec.
@@ -718,7 +732,7 @@ fn env_name() -> Result<String> {
 /// harness that starts, answers `initialize`, and has none of the credentials
 /// the container was built for.
 fn resolve() -> Result<Config> {
-    let agent = env_name()?;
+    let agent = env_name();
 
     let spec_dir =
         std::env::var("HIVE_SPEC_DIR").unwrap_or_else(|_| "/etc/hive/agents".to_string());
