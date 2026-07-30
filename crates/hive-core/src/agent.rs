@@ -246,6 +246,28 @@ pub fn config_files(spec: &AgentSpec, h: &HarnessDef) -> Result<Vec<InjectFile>,
     let servers: Vec<McpServer> = spec
         .mcp
         .iter()
+        // An HTTP server must NOT reach Claude Code's config file, because
+        // `hive-acp` already hands the same server to the same harness at
+        // `session/new`, with headers fetched from the broker.
+        //
+        // Two definitions under one name do not merge and do not conflict
+        // loudly. The config entry wins, the injected one is never contacted —
+        // no request is made to it at all — and the config entry cannot
+        // authenticate, because the agent SDK behind `claude-agent-acp` does
+        // not run a `headersHelper`. The agent ends up with no vault tools and
+        // says it "needs authorization", which is the one thing that is not
+        // wrong with it.
+        //
+        // Verified by giving the injected server a name the config did not
+        // already use: the full initialize → tools/list → tools/call handshake
+        // completes and `vault-info` returns the vault.
+        //
+        // The cost is that `claude` run BY HAND inside the container no longer
+        // sees HTTP MCP servers — only the ACP path does. That is the right way
+        // round: the ACP path is how hive agents actually run, and it is the one
+        // that was broken. Stdio servers are untouched; hive-acp does not inject
+        // those.
+        .filter(|m| !(h.id == "claude" && matches!(m.transport, hive_spec::McpTransport::Http)))
         .map(|m| McpServer {
             name: m.name.clone(),
             transport: match m.transport {
@@ -381,6 +403,57 @@ id = "claude"
             extra = extra
         );
         AgentSpec::from_toml(&base).expect("valid spec")
+    }
+
+    #[test]
+    fn an_http_server_is_kept_out_of_claudes_config_because_hive_acp_injects_it() {
+        // Both mechanisms deliver the SAME server under the SAME name. They do
+        // not merge and they do not conflict loudly: the config entry wins, the
+        // injected one is never contacted, and the config entry cannot
+        // authenticate because the agent SDK does not run a headersHelper. The
+        // agent loses the tools entirely and blames authorization.
+        let spec = spec_toml(
+            r#"
+[[mcp]]
+name = "parachute"
+transport = "http"
+url = "https://vault.example/mcp"
+credential = "mcp/parachute"
+
+[[mcp]]
+name = "local"
+transport = "stdio"
+command = "some-server"
+"#,
+        );
+        let files = config_files(&spec, crate::harness::lookup("claude").unwrap()).unwrap();
+        let body: String = files.iter().map(|f| String::from_utf8_lossy(&f.contents)).collect();
+        assert!(
+            !body.contains("vault.example"),
+            "the HTTP server reached claude's config and will shadow the injected one:\n{body}"
+        );
+        // Stdio is untouched — hive-acp injects only HTTP servers, so there is
+        // nothing for a stdio entry to collide with.
+        assert!(body.contains("some-server"), "stdio server was dropped too:\n{body}");
+    }
+
+    #[test]
+    fn other_harnesses_still_get_http_servers_in_their_config() {
+        // The exclusion is specific to the harness hive-acp injects into.
+        // Codex has no injection path, so its config file is the only way it
+        // ever learns about an HTTP server.
+        let spec = spec_toml(
+            r#"
+[[mcp]]
+name = "parachute"
+transport = "http"
+url = "https://vault.example/mcp"
+credential = "mcp/parachute"
+"#,
+        );
+        let files = config_files(&spec, crate::harness::lookup("codex").unwrap()).unwrap();
+        let body: String = files.iter().map(|f| String::from_utf8_lossy(&f.contents)).collect();
+        assert!(body.contains("vault.example"), "codex lost its HTTP server:\n{body}");
     }
 
     #[test]
