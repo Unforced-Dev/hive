@@ -113,74 +113,10 @@ struct McpEntry {
     credential: Option<String>,
 }
 
-/// Ask the broker for a server's headers, from inside the container.
-///
-/// The broker listens on a unix socket bind-mounted into the agent's container,
-/// which this process — running on the host, possibly on the far side of a
-/// Docker VM — cannot reach. `hive-headers` already lives in the image for
-/// exactly this conversation, so it is reused rather than reimplemented: the
-/// fetch stays grant-checked and audited, and there is one code path that talks
-/// to the broker instead of two.
-///
-/// A failure is logged and the server is attached WITHOUT credentials rather
-/// than dropped. An MCP server the agent can see and gets 401 from is a
-/// diagnosable problem; a server that silently vanished is not.
-fn fetch_headers(container: &str, server: &str) -> Vec<(String, String)> {
-    let out = Command::new(find_docker())
-        .args(["exec", "-e"])
-        .arg(format!("CLAUDE_CODE_MCP_SERVER_NAME={server}"))
-        .args([container, "hive-headers"])
-        .output();
-    let out = match out {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            eprintln!(
-                "hive-acp: no credentials for MCP server {server:?}: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return Vec::new();
-        }
-        Err(e) => {
-            eprintln!("hive-acp: could not reach the broker for {server:?}: {e}");
-            return Vec::new();
-        }
-    };
-    let body = String::from_utf8_lossy(&out.stdout);
-    // The helper prints the headers FLAT — `{name: value, …}` — because that is
-    // what Claude Code requires of a headersHelper on stdout, and the helper has
-    // exactly one output format for both callers.
-    //
-    // It used to print the broker's `{"headers": {…}}` envelope, and this
-    // function read the nested map. That worked HERE and silently broke the
-    // other caller: Claude Code discards a helper response whose values are not
-    // strings, so `{"headers": {…}}` produced an unauthenticated request, a 401,
-    // and a server recorded as needing interactive OAuth. Both callers now read
-    // the same flat shape; `hive_headers::flatten` is the only place that knows
-    // about the envelope.
-    let parsed: serde_json::Value = match serde_json::from_str(body.trim()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("hive-acp: broker returned unparseable headers for {server:?}: {e}");
-            return Vec::new();
-        }
-    };
-    let Some(map) = parsed.as_object() else {
-        eprintln!("hive-acp: broker response for {server:?} was not a JSON object");
-        return Vec::new();
-    };
-    // Tolerate the old envelope so a new hive-acp against an older agent image
-    // keeps working. Mixed versions are the normal state during a rollout, and
-    // the failure this would otherwise cause is the silent 401 again.
-    if let Some(nested) = map.get("headers").and_then(|h| h.as_object()) {
-        return nested
-            .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect();
-    }
-    map.iter()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-        .collect()
-}
+/// The stdio MCP server the harness spawns for each HTTP server hive attaches.
+/// Shipped in the agent image; it asks the broker for credentials per message,
+/// so nothing here ever holds a token.
+const BRIDGE: &str = "/usr/local/bin/hive-mcp-bridge";
 
 /// Is this an existing directory *inside the container*?
 ///
@@ -236,10 +172,6 @@ fn rewrite_session_new(line: &str, mcp: &[McpEntry], container: &str) -> Option<
     inject(
         line,
         mcp,
-        &|e: &McpEntry| match &e.credential {
-            Some(_) => fetch_headers(container, &e.name),
-            None => Vec::new(),
-        },
         // Resolving the workspace costs two `docker` calls, so it is deferred
         // until something actually needs it — which is only when the client
         // sent a cwd the container does not have.
@@ -255,7 +187,6 @@ fn rewrite_session_new(line: &str, mcp: &[McpEntry], container: &str) -> Option<
 fn inject(
     line: &str,
     mcp: &[McpEntry],
-    headers_for: &dyn Fn(&McpEntry) -> Vec<(String, String)>,
     workspace: &dyn Fn() -> String,
     dir_exists: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
@@ -288,20 +219,41 @@ fn inject(
             .or_insert_with(|| serde_json::Value::Array(Vec::new()))
             .as_array_mut()?;
         for e in mcp {
-            let headers: Vec<serde_json::Value> = headers_for(e)
-                .into_iter()
-                .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
-                .collect();
-            // `type: "http"` selects the McpServerHttp variant of ACP's
-            // McpServer union. `headers` is required by the schema even when
-            // empty.
+            // Attached as STDIO, pointing at `hive-mcp-bridge`, rather than as
+            // HTTP with an `Authorization` header.
+            //
+            // ACP headers are fixed for the life of the session. Parachute's
+            // access tokens last 15 minutes and a Buzz agent's session lasts
+            // hours, so an injected header was correct at `session/new` and
+            // dead a quarter of an hour later — with nothing able to repair it
+            // from inside. Claude Code re-runs a `headersHelper` on 401, but a
+            // connector handed a bare header once has nothing to re-run, and
+            // renewing the STORED credential (which hived does) cannot reach a
+            // session that already holds the old value.
+            //
+            // The bridge asks the broker for credentials on every message, so
+            // there is no window in which a stale token is held — no token is
+            // held at all. It also keeps the secret out of this payload, which
+            // previously carried it in clear.
+            let mut args = vec![
+                "--url".to_string(),
+                e.url.clone(),
+                "--server".to_string(),
+                e.name.clone(),
+            ];
+            // A server the spec gave no credential is open; telling the bridge
+            // so keeps it from asking the broker for one that was never
+            // configured and failing every message with a broker error.
+            if e.credential.is_none() {
+                args.push("--anonymous".to_string());
+            }
             servers.push(serde_json::json!({
-                "type": "http",
                 "name": e.name,
-                "url": e.url,
-                "headers": headers,
+                "command": BRIDGE,
+                "args": args,
+                "env": [],
             }));
-            eprintln!("hive-acp: attached MCP server {} -> {}", e.name, e.url);
+            eprintln!("hive-acp: attached MCP server {} -> {} (via bridge)", e.name, e.url);
         }
         rewrote = true;
     }
@@ -327,12 +279,6 @@ mod tests {
             credential: Some(format!("mcp/{name}")),
         }
     }
-    fn creds(_: &McpEntry) -> Vec<(String, String)> {
-        vec![("Authorization".into(), "Bearer TOKEN".into())]
-    }
-    fn none(_: &McpEntry) -> Vec<(String, String)> {
-        Vec::new()
-    }
 
     /// A container whose only directory is the agent workspace — so any cwd the
     /// client sends is a host path, which is the case that matters.
@@ -352,9 +298,8 @@ mod tests {
     fn inject_mcp_only(
         line: &str,
         mcp: &[McpEntry],
-        headers_for: &dyn Fn(&McpEntry) -> Vec<(String, String)>,
     ) -> Option<String> {
-        inject(line, mcp, headers_for, &workspace, &everything)
+        inject(line, mcp, &workspace, &everything)
     }
 
     #[test]
@@ -369,7 +314,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}"#,
         ] {
-            assert!(inject_mcp_only(line, &e, &none).is_none(), "rewrote: {line}");
+            assert!(inject_mcp_only(line, &e).is_none(), "rewrote: {line}");
         }
     }
 
@@ -378,14 +323,14 @@ mod tests {
         // ACP framing is not something to assume. If messages ever stop being
         // newline-delimited, this must degrade to a transparent pipe instead of
         // silently swallowing traffic.
-        assert!(inject_mcp_only("not json at all", &[entry("p")], &none).is_none());
-        assert!(inject_mcp_only("", &[entry("p")], &none).is_none());
+        assert!(inject_mcp_only("not json at all", &[entry("p")]).is_none());
+        assert!(inject_mcp_only("", &[entry("p")]).is_none());
     }
 
     #[test]
     fn an_agent_with_no_mcp_servers_is_never_rewritten() {
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"mcpServers":[]}}"#;
-        assert!(inject_mcp_only(line, &[], &creds).is_none());
+        assert!(inject_mcp_only(line, &[]).is_none());
     }
 
     #[test]
@@ -394,49 +339,52 @@ mod tests {
         // hive are not alternatives. Dropping the client's would look like a
         // Buzz bug rather than something hive did.
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w","mcpServers":[{"name":"buzzy","command":"x","args":[],"env":[]}]}}"#;
-        let out = inject_mcp_only(line, &[entry("parachute")], &creds).expect("rewritten");
+        let out = inject_mcp_only(line, &[entry("parachute")]).expect("rewritten");
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         let servers = v["params"]["mcpServers"].as_array().unwrap();
         assert_eq!(servers.len(), 2, "{out}");
         assert_eq!(servers[0]["name"], "buzzy");
         assert_eq!(servers[1]["name"], "parachute");
-        assert_eq!(servers[1]["type"], "http");
+        assert_eq!(servers[1]["command"], BRIDGE);
         assert_eq!(v["params"]["cwd"], "/w", "unrelated params must survive");
     }
 
     #[test]
-    fn the_injected_server_matches_the_mcpserverhttp_variant() {
-        // ACP selects the variant by `type`, and `headers` is required by the
-        // schema even when empty. Emitting the stdio shape here means the
-        // harness never reaches the server at all.
+    fn the_injected_server_is_the_stdio_bridge_not_a_bare_http_header() {
+        // The whole point of the bridge. ACP headers are frozen at session/new;
+        // Parachute tokens last 15 minutes and sessions last hours, so an
+        // injected Authorization header is correct at the start and dead by the
+        // first heartbeat, with nothing able to refresh it from inside.
         let out = inject_mcp_only(
             r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
             &[entry("parachute")],
-            &creds,
         )
         .expect("rewritten");
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-        let s = &v["params"]["mcpServers"][0];
-        assert_eq!(s["type"], "http");
-        assert_eq!(s["url"], "https://vault.example/parachute/mcp");
-        assert_eq!(s["headers"][0]["name"], "Authorization");
-        assert_eq!(s["headers"][0]["value"], "Bearer TOKEN");
+        let srv = &v["params"]["mcpServers"][0];
+        assert_eq!(srv["name"], "parachute");
+        assert_eq!(srv["command"], BRIDGE);
+        let args: Vec<&str> =
+            srv["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+        assert_eq!(args, ["--url", "https://vault.example/parachute/mcp", "--server", "parachute"]);
+        assert!(srv.get("type").is_none(), "stdio is selected by the ABSENCE of `type`");
     }
 
     #[test]
-    fn a_server_whose_credential_cannot_be_fetched_is_still_attached() {
-        // Attached-and-401 is diagnosable; silently absent is not. The agent
-        // reports an authorization failure naming the server, which points at
-        // the broker rather than at a mystery.
+    fn no_credential_ever_appears_in_the_session_new_payload() {
+        // This payload crosses a process boundary and is logged by anything
+        // debugging ACP traffic. It used to carry a bearer token in clear; now
+        // the bridge fetches one per message, so there is nothing here to leak
+        // and nothing here to go stale.
         let out = inject_mcp_only(
             r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
             &[entry("parachute")],
-            &none,
         )
         .expect("rewritten");
-        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-        assert_eq!(v["params"]["mcpServers"][0]["name"], "parachute");
-        assert!(v["params"]["mcpServers"][0]["headers"].as_array().unwrap().is_empty());
+        let lower = out.to_lowercase();
+        for probe in ["authorization", "bearer", "headers"] {
+            assert!(!lower.contains(probe), "{probe:?} leaked into the payload: {out}");
+        }
     }
 
     #[test]
@@ -446,7 +394,6 @@ mod tests {
         let out = inject_mcp_only(
             r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
             &[entry("p")],
-            &none,
         )
         .expect("rewritten");
         assert!(out.ends_with('\n'), "{out:?}");
@@ -460,7 +407,7 @@ mod tests {
         // machine running the agent` — which reads as a hive failure with no
         // hint that a path was the problem.
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/private/tmp","mcpServers":[]}}"#;
-        let out = inject(line, &[], &none, &workspace, &only_workspace).expect("rewritten");
+        let out = inject(line, &[], &workspace, &only_workspace).expect("rewritten");
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["params"]["cwd"], "/home/agent/work");
     }
@@ -472,7 +419,7 @@ mod tests {
         // mount the operator configured on purpose.
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/srv/shared"}}"#;
         assert!(
-            inject(line, &[], &none, &workspace, &everything).is_none(),
+            inject(line, &[], &workspace, &everything).is_none(),
             "a valid cwd and no MCP servers is nothing to rewrite"
         );
     }
@@ -483,7 +430,7 @@ mod tests {
         // having MCP servers would leave the plainest possible agent — no MCP
         // at all — as the one that cannot open a session.
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/Users/someone/code"}}"#;
-        let out = inject(line, &[], &creds, &workspace, &only_workspace).expect("rewritten");
+        let out = inject(line, &[], &workspace, &only_workspace).expect("rewritten");
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["params"]["cwd"], "/home/agent/work");
         assert!(v["params"].get("mcpServers").is_none(), "invented an mcpServers key");
@@ -494,7 +441,7 @@ mod tests {
         // Only `session/new` declares a cwd. Rewriting a field that happens to
         // share the name on some other method would corrupt it.
         let line = r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"cwd":"/private/tmp"}}"#;
-        assert!(inject(line, &[entry("p")], &creds, &workspace, &only_workspace).is_none());
+        assert!(inject(line, &[entry("p")], &workspace, &only_workspace).is_none());
     }
 
     #[test]
@@ -507,7 +454,7 @@ mod tests {
             calls.set(calls.get() + 1);
             "/home/agent/work".to_string()
         };
-        let _ = inject(line, &[entry("p")], &creds, &counting, &everything);
+        let _ = inject(line, &[entry("p")], &counting, &everything);
         assert_eq!(calls.get(), 0, "resolved the workspace it did not need");
     }
 }

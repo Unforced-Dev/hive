@@ -5,6 +5,7 @@ members = [
     "crates/hive-core",
     "crates/hive-broker",
     "crates/hive-headers",
+    "crates/hive-mcp-bridge",
     "crates/hived",
     "crates/hive-cli",
     "crates/hive-acp",
