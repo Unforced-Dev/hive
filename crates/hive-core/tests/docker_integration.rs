@@ -14,6 +14,12 @@
 //! Every test cleans up after itself and uses a distinct name prefix, so a
 //! failed run leaves at most its own debris.
 //!
+//! STOP `hived` FIRST if one is running on this daemon. Its reconciler owns
+//! every container labelled `hive.managed`, sees a test container with no spec,
+//! and removes it — within one `HIVE_INTERVAL`. The test then fails with empty
+//! `docker exec` output and no hint as to why; the evidence is in hived's log
+//! (`planned agent="itest-…" action=Remove`), not in the test's.
+//!
 //! They must run SERIALLY (`--test-threads=1`, which `build.sh --docker` sets).
 //! They share one Docker daemon, and `list()` observes global state — every
 //! hive-managed container on the box, including ones another test is mid-way
@@ -174,6 +180,39 @@ fn the_state_volume_is_writable_by_the_agent() {
         &["sh", "-c", "touch /home/agent/state/probe && echo ok"],
     );
     assert_eq!(out, "ok", "agent cannot write its own state volume: {out}");
+
+    cleanup(&b, agent);
+}
+
+#[test]
+fn an_orphaned_grandchild_is_reaped_rather_than_left_a_zombie() {
+    if !enabled() {
+        eprintln!("skipping: set HIVE_DOCKER_TESTS=1");
+        return;
+    }
+    let b = DockerBackend::discover().expect("docker");
+    let agent = "itest-reap";
+    cleanup(&b, agent);
+    bring_up(&b, &plan_for(agent, "h1", vec![]), agent);
+
+    // The subshell exits immediately, so `sleep` is orphaned and reparented to
+    // PID 1 before it finishes. Without an init that wait()s, it stays a zombie
+    // for the life of the container — and `kill(pid, 0)` on a zombie succeeds,
+    // which is how a supervisor running inside an agent container mistakes a
+    // dead process for a live one. Asserting on /proc rather than on the docker
+    // create argv, because the flag is not the point; the reaping is.
+    let out = exec(
+        &Names::container(agent),
+        &[
+            "sh",
+            "-c",
+            "(sleep 1 &) ; sleep 3; \
+             z=0; for d in /proc/[0-9]*; do \
+               grep -q '^State:.*zombie' \"$d/status\" 2>/dev/null && z=$((z+1)); \
+             done; echo \"$z\"",
+        ],
+    );
+    assert_eq!(out, "0", "orphaned processes are accumulating as zombies: {out}");
 
     cleanup(&b, agent);
 }
