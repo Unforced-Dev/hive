@@ -350,6 +350,22 @@ ENV AMP_HOME=/home/agent/state/amp
 # it. The entrypoint symlinks the shared 127 MB binary in.
 ENV GROK_HOME=/home/agent/state/grok
 
+# The same rule, applied to toolchains the AGENT installs at runtime.
+#
+# Everything above points a harness hive ships at the volume. Nothing pointed
+# what an agent installs for itself, and the default targets — $HOME/.bun,
+# $HOME/.local — are on the ephemeral layer. So `bun` and everything installed
+# with it vanished on the next recreate, while the agent's checkouts and
+# credentials survived: "your work is intact" and `bun: command not found` in
+# the same breath, which is a genuinely confusing pair of signals to debug.
+#
+# APPENDED to PATH, never prepended. The build asserts that every harness in
+# hive's catalog resolves on PATH; a state directory ahead of /usr/local/bin
+# would let a stale agent-installed binary shadow the harness the image proved
+# was there, and it would do so only after a recreate.
+ENV BUN_INSTALL=/home/agent/state/tools/bun
+ENV PATH=$PATH:/home/agent/state/tools/bun/bin:/home/agent/state/tools/local/bin
+
 # Create the state root AS THE AGENT USER, before VOLUME.
 #
 # Docker creates a VOLUME's mountpoint itself if it does not exist, owned by
