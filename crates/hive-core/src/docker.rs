@@ -299,6 +299,18 @@ impl ContainerBackend for DockerBackend {
         // it is the only thing that starts containers.
         args.extend(["--restart".into(), "unless-stopped".into()]);
 
+        // PID 1 here is `sleep infinity` (environment mode) or buzz-acp (relay
+        // mode), and neither wait()s on processes it did not spawn. An agent's
+        // orphaned grandchildren are reparented to it and stay zombies forever.
+        // That is not merely untidy: `kill(pid, 0)` SUCCEEDS on a zombie, so any
+        // supervisor the agent runs inside the container reads a dead child as
+        // alive. Found when Parachute's hub — which probes liveness exactly that
+        // way — reported a correctly-killed process as `port-stuck`, and when 19
+        // zombies had accumulated in one agent container inside a day.
+        // docker-init (tini) as PID 1 reaps them and forwards signals; the
+        // project's own Dockerfiles do the same thing for the same reason.
+        args.push("--init".into());
+
         // A harness is a userspace process making HTTP calls; it needs no
         // capabilities and never needs to gain privileges. Dropping these costs
         // nothing and removes a whole class of escalation from a container that,
