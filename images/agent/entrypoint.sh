@@ -16,7 +16,8 @@ set -eu
 STATE="${HIVE_STATE_DIR:-/home/agent/state}"
 
 # Directories the env vars in the image point at.
-for d in claude codex config config/goose data amp work; do
+for d in claude codex config config/goose data amp work \
+         tools/bun/bin tools/local/bin; do
     mkdir -p "$STATE/$d"
 done
 
@@ -37,6 +38,12 @@ link_state() {
 # recreate — which a spec edit triggers — silently deletes the agent's work
 # while its sessions and credentials survive on the volume.
 link_state work       work
+
+# $HOME/.local is where pip --user, pipx, uv and most curl|sh installers land,
+# and none of them offer an env override worth relying on. Its bin directory is
+# on PATH (see the Dockerfile), so linking the whole tree is what makes an
+# agent-installed tool outlive the container it was installed in.
+link_state .local     tools/local
 
 link_state .grok      grok
 link_state .kimi      kimi

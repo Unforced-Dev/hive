@@ -302,3 +302,46 @@ fn removing_a_container_preserves_its_state_volume() {
 
     cleanup(&b, agent);
 }
+
+#[test]
+fn a_tool_the_agent_installs_survives_container_replacement() {
+    if !enabled() {
+        eprintln!("skipping: set HIVE_DOCKER_TESTS=1");
+        return;
+    }
+    let b = DockerBackend::discover().expect("docker");
+    let agent = "itest-tools";
+    cleanup(&b, agent);
+    bring_up(&b, &plan_for(agent, "h1", vec![]), agent);
+    let c = Names::container(agent);
+
+    // Installed the way an agent installs things: into $BUN_INSTALL and into
+    // $HOME/.local, the two prefixes real installers pick by default. Written
+    // through $HOME/.local rather than the state path directly, because the
+    // link is half of what is under test.
+    exec(
+        &c,
+        &[
+            "sh",
+            "-c",
+            "printf '#!/bin/sh\\necho alive\\n' > \"$BUN_INSTALL/bin/faketool\" \
+             && printf '#!/bin/sh\\necho alive\\n' > \"$HOME/.local/bin/fakelocal\" \
+             && chmod +x \"$BUN_INSTALL/bin/faketool\" \"$HOME/.local/bin/fakelocal\"",
+        ],
+    );
+
+    // The recreate an agent actually meets: a spec edit, or an ops change to a
+    // create-time flag. Credentials and checkouts survive it because they are on
+    // the volume; before this, the toolchain that produced them did not, and the
+    // agent came back to `bun: command not found` seconds after being told its
+    // work was intact.
+    b.remove(&c).expect("remove");
+    b.create_and_start(&plan_for(agent, "h2", vec![])).expect("recreate");
+
+    // `command -v` rather than a path check: surviving on disk is not the claim,
+    // resolving on PATH is.
+    let out = exec(&c, &["sh", "-c", "faketool && fakelocal"]);
+    assert_eq!(out, "alive\nalive", "agent-installed tools did not survive replacement: {out}");
+
+    cleanup(&b, agent);
+}
