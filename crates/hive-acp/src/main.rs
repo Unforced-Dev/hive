@@ -1026,9 +1026,18 @@ fn main() -> Result<()> {
     // Forward the environment buzz-acp set for this harness. That is how the
     // relay URL, the agent's identity and Buzz's per-agent settings reach the
     // harness; without it the harness starts unconfigured and idles.
-    for (k, v) in std::env::vars() {
+    //
+    // `-e NAME` and not `-e NAME=value`: with no `=`, docker reads the value
+    // from its own environment, which it inherits from us. Same value arrives
+    // in the container either way — but `NAME=value` puts it in the docker
+    // client's argv, and BUZZ_PRIVATE_KEY is one of these variables. Process
+    // arguments are readable by any process of the same uid, so the `=value`
+    // form published every agent's nsec to the whole host account. Found by a
+    // `pgrep` run for an unrelated reason, which is how this class of leak is
+    // always found. Do not "simplify" this back to a formatted pair.
+    for (k, _) in std::env::vars() {
         if k.starts_with("BUZZ_") || k.starts_with("ACP_") {
-            cmd.arg("-e").arg(format!("{k}={v}"));
+            cmd.arg("-e").arg(&k);
         }
     }
     cmd.arg(&cfg.container);
