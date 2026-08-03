@@ -70,7 +70,22 @@ impl DockerBackend {
     }
 
     fn run(&self, op: &'static str, target: &str, args: &[&str]) -> Result<String, BackendError> {
-        let out = self.cmd().args(args).output()?;
+        self.run_env(op, target, args, &BTreeMap::new())
+    }
+
+    /// `run`, with `env` given to the docker client through its environment
+    /// rather than its arguments.
+    ///
+    /// This is what lets [`create_args`] emit `-e NAME` instead of
+    /// `-e NAME=value`; see the comment there for why that matters.
+    fn run_env(
+        &self,
+        op: &'static str,
+        target: &str,
+        args: &[&str],
+        env: &BTreeMap<String, String>,
+    ) -> Result<String, BackendError> {
+        let out = self.cmd().args(args).envs(env).output()?;
         if !out.status.success() {
             return Err(BackendError::Operation {
                 operation: op,
@@ -287,58 +302,14 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn create_and_start(&self, plan: &ContainerPlan) -> Result<String, BackendError> {
-        let mut args: Vec<String> = vec!["create".into(), "--name".into(), plan.name.clone()];
+        let args = create_args(plan);
 
-        args.extend(["--network".into(), plan.network.clone()]);
-        args.extend(["--memory".into(), plan.memory.clone()]);
-        args.extend(["--cpus".into(), plan.cpus.to_string()]);
-        args.extend(["--pids-limit".into(), plan.pids_limit.to_string()]);
-
-        // Survive a host reboot without the daemon having to be up first. The
-        // reconciler tolerates this: it reads RestartCount rather than assuming
-        // it is the only thing that starts containers.
-        args.extend(["--restart".into(), "unless-stopped".into()]);
-
-        // PID 1 here is `sleep infinity` (environment mode) or buzz-acp (relay
-        // mode), and neither wait()s on processes it did not spawn. An agent's
-        // orphaned grandchildren are reparented to it and stay zombies forever.
-        // That is not merely untidy: `kill(pid, 0)` SUCCEEDS on a zombie, so any
-        // supervisor the agent runs inside the container reads a dead child as
-        // alive. Found when Parachute's hub — which probes liveness exactly that
-        // way — reported a correctly-killed process as `port-stuck`, and when 19
-        // zombies had accumulated in one agent container inside a day.
-        // docker-init (tini) as PID 1 reaps them and forwards signals; the
-        // project's own Dockerfiles do the same thing for the same reason.
-        args.push("--init".into());
-
-        // A harness is a userspace process making HTTP calls; it needs no
-        // capabilities and never needs to gain privileges. Dropping these costs
-        // nothing and removes a whole class of escalation from a container that,
-        // by design, executes model-authored code.
-        args.extend(["--security-opt".into(), "no-new-privileges".into()]);
-        args.extend(["--cap-drop".into(), "ALL".into()]);
-
-        for (k, v) in &plan.env {
-            args.push("-e".into());
-            args.push(format!("{k}={v}"));
-        }
-        for (k, v) in &plan.labels {
-            args.push("--label".into());
-            args.push(format!("{k}={v}"));
-        }
-        for m in &plan.volumes {
-            args.push("-v".into());
-            let ro = if m.read_only { ":ro" } else { "" };
-            args.push(format!("{}:{}{}", m.source, m.target, ro));
-        }
-
-        args.push(plan.image.clone());
-        args.extend(plan.command.iter().cloned());
-
-        let id = self.run(
+        // plan.env travels in the client's environment, not its arguments.
+        let id = self.run_env(
             "create",
             &plan.name,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &plan.env,
         )?;
 
         // ORDER IS LOAD-BEARING: create, inject, THEN start. Harnesses read
@@ -381,6 +352,81 @@ impl ContainerBackend for DockerBackend {
     }
 }
 
+/// Build the `docker create` argument vector for a plan.
+///
+/// Split out from [`DockerBackend::create_and_start`] so a test can assert what
+/// does and does not reach the argument vector. That is the whole point of the
+/// `-e` handling below, and an untested version of it silently regresses the
+/// first time someone tidies the loop.
+fn create_args(plan: &ContainerPlan) -> Vec<String> {
+    let mut args: Vec<String> = vec!["create".into(), "--name".into(), plan.name.clone()];
+
+    args.extend(["--network".into(), plan.network.clone()]);
+    args.extend(["--memory".into(), plan.memory.clone()]);
+    args.extend(["--cpus".into(), plan.cpus.to_string()]);
+    args.extend(["--pids-limit".into(), plan.pids_limit.to_string()]);
+
+    // Survive a host reboot without the daemon having to be up first. The
+    // reconciler tolerates this: it reads RestartCount rather than assuming
+    // it is the only thing that starts containers.
+    args.extend(["--restart".into(), "unless-stopped".into()]);
+
+    // PID 1 here is `sleep infinity` (environment mode) or buzz-acp (relay
+    // mode), and neither wait()s on processes it did not spawn. An agent's
+    // orphaned grandchildren are reparented to it and stay zombies forever.
+    // That is not merely untidy: `kill(pid, 0)` SUCCEEDS on a zombie, so any
+    // supervisor the agent runs inside the container reads a dead child as
+    // alive. Found when Parachute's hub — which probes liveness exactly that
+    // way — reported a correctly-killed process as `port-stuck`, and when 19
+    // zombies had accumulated in one agent container inside a day.
+    // docker-init (tini) as PID 1 reaps them and forwards signals; the
+    // project's own Dockerfiles do the same thing for the same reason.
+    args.push("--init".into());
+
+    // A harness is a userspace process making HTTP calls; it needs no
+    // capabilities and never needs to gain privileges. Dropping these costs
+    // nothing and removes a whole class of escalation from a container that,
+    // by design, executes model-authored code.
+    args.extend(["--security-opt".into(), "no-new-privileges".into()]);
+    args.extend(["--cap-drop".into(), "ALL".into()]);
+
+    // `-e NAME`, not `-e NAME=value`. With no `=`, docker reads the value from
+    // its own environment — which `run_env` sets — so the container receives
+    // exactly the same thing either way. The difference is where the value
+    // sits meanwhile: argv is not a private channel (on Linux
+    // `/proc/<pid>/cmdline` is world-readable) whereas a process environment
+    // is owner-only.
+    //
+    // This matters because plan.env is `environment()` plus the broker's
+    // resolved secrets — `container_plan` ends with `env.extend(secrets)`. So
+    // at least one pair here is a live credential on every create: the harness
+    // token always, and the agent's nsec for any spec that delivers it by env.
+    //
+    // It narrows the exposure, it does not remove it. Same-uid processes still
+    // read the environment, and docker socket access is root-equivalent
+    // regardless. What it stops is accidental disclosure — the stray `ps`, the
+    // pasted `pgrep` output, the log line — which is how keys actually escape.
+    // Do not "simplify" this back into a formatted pair.
+    for k in plan.env.keys() {
+        args.push("-e".into());
+        args.push(k.clone());
+    }
+    for (k, v) in &plan.labels {
+        args.push("--label".into());
+        args.push(format!("{k}={v}"));
+    }
+    for m in &plan.volumes {
+        args.push("-v".into());
+        let ro = if m.read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{}", m.source, m.target, ro));
+    }
+
+    args.push(plan.image.clone());
+    args.extend(plan.command.iter().cloned());
+
+    args
+}
+
 /// Labels for an agent's container.
 pub fn labels_for(agent: &str, spec_hash: &str, harness: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
@@ -394,6 +440,67 @@ pub fn labels_for(agent: &str, spec_hash: &str, harness: &str) -> BTreeMap<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan whose env holds one ordinary setting and one credential.
+    fn plan_with_a_secret(secret: &str) -> ContainerPlan {
+        ContainerPlan {
+            name: "hive-alice".into(),
+            image: "hive/agent:latest".into(),
+            command: vec!["buzz-acp".into()],
+            env: BTreeMap::from([
+                ("BUZZ_RELAY_URL".to_string(), "wss://r.example".to_string()),
+                ("BUZZ_PRIVATE_KEY".to_string(), secret.to_string()),
+            ]),
+            labels: labels_for("alice", "abc123", "claude"),
+            network: "hive".into(),
+            volumes: Vec::new(),
+            memory: "2g".into(),
+            cpus: 1.0,
+            pids_limit: 256,
+            inject: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn no_env_value_reaches_the_docker_argument_vector() {
+        // Process arguments are not a private channel: `/proc/<pid>/cmdline` is
+        // world-readable on Linux, and on any platform a same-uid `ps` shows
+        // them. plan.env carries the broker's resolved secrets, so emitting
+        // `-e NAME=value` published every agent's credential to anything that
+        // could run `ps` — which is how this was found, in `pgrep` output
+        // gathered for an unrelated reason.
+        //
+        // The value still reaches the container: `run_env` puts it in the
+        // docker client's own environment, and a bare `-e NAME` tells docker to
+        // read it from there.
+        let secret = "nsec1thisvaluemustnotappearinargv";
+        let args = create_args(&plan_with_a_secret(secret));
+
+        assert!(
+            !args.iter().any(|a| a.contains(secret)),
+            "a credential from plan.env reached argv: {args:?}"
+        );
+
+        // Positive control. Without this the assertion above also passes when
+        // the variable is simply never forwarded, which would break every
+        // agent rather than secure it.
+        let by_name = |n: &str| args.windows(2).any(|w| w[0] == "-e" && w[1] == n);
+        assert!(
+            by_name("BUZZ_PRIVATE_KEY"),
+            "the variable must still be forwarded by name: {args:?}"
+        );
+        assert!(
+            by_name("BUZZ_RELAY_URL"),
+            "non-secret settings go the same way: {args:?}"
+        );
+
+        // And no pair form survives anywhere, secret or not.
+        let pair = |a: &String| a.starts_with("BUZZ_") && a.contains('=');
+        assert!(
+            !args.iter().any(pair),
+            "an env pair was still formatted into argv: {args:?}"
+        );
+    }
 
     #[test]
     fn managed_label_is_always_set_so_reconcile_cannot_touch_foreign_containers() {
