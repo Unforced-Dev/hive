@@ -9,6 +9,7 @@ members = [
     "crates/hived",
     "crates/hive-cli",
     "crates/hive-acp",
+    "crates/buzz-backend-hive",
 ]
 
 [workspace.package]

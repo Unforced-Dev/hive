@@ -1,0 +1,16 @@
+[package]
+name = "buzz-backend-hive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The binary name IS the discovery contract: Buzz Desktop scans PATH for
+# executables named `buzz-backend-<id>`. Renaming this unregisters the provider.
+[[bin]]
+name = "buzz-backend-hive"
+path = "src/main.rs"
+
+[dependencies]
+hive-spec.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

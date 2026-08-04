@@ -83,6 +83,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-backend-hive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hive-spec",
+ "serde_json",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
